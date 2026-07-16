@@ -15,7 +15,8 @@ import main
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     config = main.AppConfig(save_root=tmp_path)
     monkeypatch.setattr(main, "RUNTIME_CONFIG", config)
-    return TestClient(main.app)
+    with TestClient(main.app) as test_client:
+        yield test_client
 
 
 def test_save_creates_file_and_returns_path(client: TestClient, tmp_path: Path) -> None:
@@ -53,9 +54,8 @@ def test_save_allows_text_within_byte_limit(
 ) -> None:
     config = main.AppConfig(save_root=tmp_path, max_text_bytes=2)
     monkeypatch.setattr(main, "RUNTIME_CONFIG", config)
-    client = TestClient(main.app)
-
-    response = client.post("/save", json={"text": "é", "path": "within.txt"})
+    with TestClient(main.app) as client:
+        response = client.post("/save", json={"text": "é", "path": "within.txt"})
 
     assert response.status_code == 200
     assert (tmp_path / "within.txt").read_text(encoding="utf-8") == "é"
@@ -66,9 +66,8 @@ def test_save_rejects_text_exceeding_byte_limit(
 ) -> None:
     config = main.AppConfig(save_root=tmp_path, max_text_bytes=3)
     monkeypatch.setattr(main, "RUNTIME_CONFIG", config)
-    client = TestClient(main.app)
-
-    response = client.post("/save", json={"text": "éé", "path": "too-large.txt"})
+    with TestClient(main.app) as client:
+        response = client.post("/save", json={"text": "éé", "path": "too-large.txt"})
 
     assert response.status_code == 413
     assert response.json() == {
@@ -82,10 +81,10 @@ def test_save_with_zero_limit_allows_large_text(
 ) -> None:
     config = main.AppConfig(save_root=tmp_path, max_text_bytes=0)
     monkeypatch.setattr(main, "RUNTIME_CONFIG", config)
-    client = TestClient(main.app)
     text = "x" * 100_000
 
-    response = client.post("/save", json={"text": text, "path": "large.txt"})
+    with TestClient(main.app) as client:
+        response = client.post("/save", json={"text": text, "path": "large.txt"})
 
     assert response.status_code == 200
     assert (tmp_path / "large.txt").read_text(encoding="utf-8") == text
@@ -121,7 +120,7 @@ def test_save_encoding_failure_removes_temp_file(
         headers={"Content-Type": "application/json"},
     )
 
-    assert response.status_code == 500
+    assert response.status_code == 400
     assert not (tmp_path / "invalid-encoding.txt").exists()
     assert list(tmp_path.glob(".invalid-encoding.txt.*.tmp")) == []
 
@@ -139,6 +138,29 @@ def test_save_overwrite_preserves_existing_permissions(
 
     assert response.status_code == 200
     assert stat.S_IMODE(target.stat().st_mode) == 0o644
+
+
+def test_save_returns_success_when_directory_fsync_fails(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_fsync = main.os.fsync
+    calls = 0
+
+    def fail_second_fsync(file_descriptor: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("sync failed")
+        real_fsync(file_descriptor)
+
+    monkeypatch.setattr(main.os, "fsync", fail_second_fsync)
+
+    response = client.post("/save", json={"text": "saved", "path": "durable.txt"})
+
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert "durability sync failed" in response.json()["warning"]
+    assert (tmp_path / "durable.txt").read_text(encoding="utf-8") == "saved"
 
 
 def test_paths_lists_files_and_directories(client: TestClient, tmp_path: Path) -> None:
@@ -179,13 +201,24 @@ def test_paths_lists_directory_contents_when_prefix_ends_with_slash(
 
 
 def test_paths_returns_at_most_30_results(client: TestClient, tmp_path: Path) -> None:
-    for index in range(35):
+    for index in reversed(range(35)):
         (tmp_path / f"file-{index:02}.txt").write_text("x", encoding="utf-8")
 
     response = client.get("/paths")
 
     assert response.status_code == 200
-    assert len(response.json()["paths"]) == 30
+    assert response.json()["paths"] == [f"file-{index:02}.txt" for index in range(30)]
+
+
+def test_paths_treats_backslash_as_a_posix_filename_character(
+    client: TestClient, tmp_path: Path
+) -> None:
+    (tmp_path / "notes\\file.txt").write_text("x", encoding="utf-8")
+
+    response = client.get("/paths", params={"prefix": "notes\\"})
+
+    assert response.status_code == 200
+    assert response.json() == {"paths": ["notes\\file.txt"]}
 
 
 @pytest.mark.parametrize("prefix", ["../", "../../secret", "/tmp/"])
@@ -209,7 +242,8 @@ def test_health_returns_not_ready_for_missing_save_root(
     missing = tmp_path / "missing"
     monkeypatch.setattr(main, "RUNTIME_CONFIG", main.AppConfig(save_root=missing))
 
-    response = TestClient(main.app).get("/health")
+    with TestClient(main.app) as client:
+        response = client.get("/health")
 
     assert response.status_code == 503
     assert "not an accessible directory" in response.json()["detail"]
@@ -220,9 +254,14 @@ def test_health_returns_not_ready_for_unwritable_save_root(
 ) -> None:
     config = main.AppConfig(save_root=tmp_path)
     monkeypatch.setattr(main, "RUNTIME_CONFIG", config)
-    monkeypatch.setattr(main.os, "access", lambda _path, _mode: False)
+    monkeypatch.setattr(
+        main,
+        "_probe_save_root",
+        lambda _path: (_ for _ in ()).throw(PermissionError("denied")),
+    )
 
-    response = TestClient(main.app).get("/health")
+    with TestClient(main.app) as client:
+        response = client.get("/health")
 
     assert response.status_code == 503
     assert "not an accessible directory" in response.json()["detail"]
@@ -240,9 +279,10 @@ def test_overwriting_config_file_does_not_change_active_save_root(
     monkeypatch.setattr(main, "RUNTIME_CONFIG", main.load_config(config_path))
 
     config_path.write_text(f'save_root: "{changed_root}"\n', encoding="utf-8")
-    response = TestClient(main.app).post(
-        "/save", json={"text": "still active", "path": "runtime.txt"}
-    )
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/save", json={"text": "still active", "path": "runtime.txt"}
+        )
 
     assert response.status_code == 200
     assert (active_root / "runtime.txt").read_text(encoding="utf-8") == "still active"
@@ -284,6 +324,15 @@ def test_config_rejects_null_or_non_string_save_root(
         main.load_config(path=config_path)
 
 
+@pytest.mark.parametrize("yaml_value", ["false", "123"])
+def test_config_rejects_non_mapping_top_level(tmp_path: Path, yaml_value: str) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml_value + "\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="must contain a YAML mapping"):
+        main.load_config(path=config_path)
+
+
 @pytest.mark.parametrize("port", [0, 65536, 70000])
 def test_config_rejects_port_outside_valid_range(tmp_path: Path, port: int) -> None:
     config_path = tmp_path / "config.yaml"
@@ -306,11 +355,49 @@ def test_config_normalizes_relative_save_root(
 ) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text("save_root: data/../saves\n", encoding="utf-8")
-    monkeypatch.chdir(tmp_path)
+    monkeypatch.chdir(tmp_path.parent)
 
     config = main.load_config(path=config_path)
 
     assert config.save_root == (tmp_path / "saves").resolve()
+
+
+@pytest.mark.parametrize("key", ["port", "max_text_bytes"])
+@pytest.mark.parametrize("value", ["-1", "1.9", "false", '"8766"'])
+def test_config_rejects_non_strict_or_invalid_integers(
+    tmp_path: Path, key: str, value: str
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(f"{key}: {value}\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match=f"config {key}"):
+        main.load_config(path=config_path)
+
+
+def test_config_rejects_negative_max_text_bytes(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("max_text_bytes: -1\n", encoding="utf-8")
+
+    with pytest.raises(
+        RuntimeError, match="max_text_bytes must be a non-negative integer"
+    ):
+        main.load_config(path=config_path)
+
+
+def test_config_rejects_malformed_yaml(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("save_root: [unterminated\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="Invalid YAML"):
+        main.load_config(path=config_path)
+
+
+def test_config_wraps_file_read_errors(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.mkdir()
+
+    with pytest.raises(RuntimeError, match="Cannot read config file"):
+        main.load_config(path=config_path)
 
 
 def test_save_accepts_absolute_path_with_normalized_relative_root(
@@ -319,10 +406,10 @@ def test_save_accepts_absolute_path_with_normalized_relative_root(
     save_root = tmp_path / "data" / ".." / "saves"
     config = main.AppConfig(save_root=save_root)
     monkeypatch.setattr(main, "RUNTIME_CONFIG", config)
-    client = TestClient(main.app)
     target = tmp_path / "saves" / "absolute.txt"
 
-    response = client.post("/save", json={"text": "ok", "path": str(target)})
+    with TestClient(main.app) as client:
+        response = client.post("/save", json={"text": "ok", "path": str(target)})
 
     assert response.status_code == 200
     assert target.read_text(encoding="utf-8") == "ok"
@@ -355,3 +442,32 @@ def test_resolve_save_path_rejects_symlink_into_application_directory(
         main._resolve_save_path(str(application_link / "main.py"), config)
 
     assert exc_info.value.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "path", ["bad\x00name.txt", "~definitely-no-such-user/file.txt"]
+)
+def test_save_rejects_invalid_user_paths(client: TestClient, path: str) -> None:
+    response = client.post("/save", json={"text": "no", "path": path})
+
+    assert response.status_code == 400
+
+
+def test_save_rejects_path_that_is_too_long(client: TestClient) -> None:
+    response = client.post("/save", json={"text": "no", "path": "x" * 5000})
+
+    assert response.status_code == 400
+
+
+def test_paths_rejects_invalid_user_paths(client: TestClient) -> None:
+    for prefix in ["bad\x00name", "~definitely-no-such-user", "x" * 5000]:
+        response = client.get("/paths", params={"prefix": prefix})
+        assert response.status_code == 400
+
+
+def test_save_rejects_extra_request_fields(client: TestClient) -> None:
+    response = client.post(
+        "/save", json={"text": "hello", "path": "ok.txt", "unexpected": True}
+    )
+
+    assert response.status_code == 422

@@ -23,6 +23,11 @@ so restart the service after making any changes. Then start the service:
 The server listens on `127.0.0.1` using the port configured in `config.yaml`
 (default `8766`).
 
+Relative `save_root` values are resolved relative to the directory containing
+the configuration file. Atomic overwrites preserve the existing Unix mode
+bits; other metadata such as timestamps, ACLs, and extended attributes is not
+preserved.
+
 ## API
 
 - `GET /health` returns service health.
@@ -30,6 +35,10 @@ The server listens on `127.0.0.1` using the port configured in `config.yaml`
   optional `max_text_bytes` setting limits the UTF-8 encoded text size; `0`
   means unlimited. Requests over the configured limit return HTTP 413.
 - `GET /paths?prefix=notes/` returns up to 30 matching paths.
+
+Request bodies reject unknown fields. Invalid paths (including NUL bytes,
+unknown `~user` expansions, and paths too long for the filesystem) return
+HTTP 400.
 
 ## Tests
 

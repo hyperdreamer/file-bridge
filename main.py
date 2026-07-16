@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,8 +30,11 @@ class AppConfig:
     """Application settings loaded from config.yaml."""
 
     save_root: Path = Path(DEFAULT_SAVE_ROOT)
-    host: str = "127.0.0.1"
     port: int = 8766
+    max_text_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "save_root", self.save_root.expanduser().resolve())
 
 
 def _load_yaml_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
@@ -47,10 +51,27 @@ def _load_yaml_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
 
 def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     raw_config = _load_yaml_config(path)
+
+    unknown_keys = set(raw_config) - {"save_root", "port", "max_text_bytes"}
+    if unknown_keys:
+        unknown = ", ".join(sorted(map(str, unknown_keys)))
+        raise RuntimeError(f"Unknown config key(s): {unknown}")
+
+    save_root = raw_config.get("save_root", DEFAULT_SAVE_ROOT)
+    if not isinstance(save_root, str):
+        raise RuntimeError("config save_root must be a non-null string")
+
+    try:
+        port = int(raw_config.get("port", 8766))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("config port must be an integer from 1 to 65535") from exc
+    if not 1 <= port <= 65535:
+        raise RuntimeError("config port must be from 1 to 65535")
+
     return AppConfig(
-        save_root=Path(str(raw_config.get("save_root", DEFAULT_SAVE_ROOT))).expanduser(),
-        host=str(raw_config.get("host", "127.0.0.1")),
-        port=int(raw_config.get("port", 8766)),
+        save_root=Path(save_root),
+        port=port,
+        max_text_bytes=int(raw_config.get("max_text_bytes", 0)),
     )
 
 
@@ -59,16 +80,15 @@ def _resolve_save_path(raw_path: str, config: AppConfig) -> Path:
     if not raw_path:
         raise HTTPException(status_code=400, detail="Missing save path")
 
-    save_root_expanded = config.save_root.expanduser()
-    save_root = save_root_expanded.resolve()
+    save_root = config.save_root
     candidate = Path(raw_path).expanduser()
-    path = candidate if candidate.is_absolute() else save_root_expanded / candidate
+    path = candidate if candidate.is_absolute() else save_root / candidate
 
-    # Match TextKit's traversal guard: collapse ``..`` without resolving
-    # symlinks, so paths such as ~/Ramdisk remain usable.
+    # Collapse ``..`` without resolving symlinks, so paths such as
+    # ~/Ramdisk remain usable.
     clean = Path(os.path.normpath(str(path)))
     try:
-        clean.relative_to(save_root_expanded)
+        clean.relative_to(save_root)
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
@@ -94,81 +114,113 @@ def _atomic_write_text(path: Path, text: str) -> None:
             temp_file.write(text)
             temp_file.flush()
             os.fsync(temp_file.fileno())
+
+        try:
+            destination_mode = stat.S_IMODE(path.stat().st_mode)
+        except FileNotFoundError:
+            pass
+        else:
+            os.chmod(temp_path, destination_mode)
+
         os.replace(temp_path, path)
-    except OSError:
+        temp_path = None
+    finally:
         if temp_path is not None:
             try:
                 temp_path.unlink(missing_ok=True)
             except OSError:
                 pass
-        raise
 
 
 app = FastAPI(title="File Bridge")
 
 
 @app.get("/health")
-async def health() -> dict[str, bool]:
+def health() -> dict[str, bool]:
+    try:
+        config = load_config()
+    except (RuntimeError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=f"Not ready: {exc}") from exc
+
+    if not config.save_root.is_dir() or not os.access(
+        config.save_root, os.R_OK | os.W_OK | os.X_OK
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail=f"Not ready: save_root is not an accessible directory: {config.save_root}",
+        )
     return {"ok": True}
 
 
 @app.post("/save")
-async def save_text(request: SaveRequest) -> dict[str, str | bool]:
+def save_text(request: SaveRequest) -> dict[str, str | bool]:
     try:
         config = load_config()
     except (RuntimeError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if config.max_text_bytes > 0:
+        try:
+            text_bytes = len(request.text.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to save text: {exc}"
+            ) from exc
+        if text_bytes > config.max_text_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"Text is {text_bytes} bytes when UTF-8 encoded; "
+                    f"maximum allowed is {config.max_text_bytes} bytes"
+                ),
+            )
 
     path = _resolve_save_path(request.path, config)
 
     try:
         _atomic_write_text(path, request.text)
-    except OSError as exc:
+    except Exception as exc:
+        message = exc.strerror if isinstance(exc, OSError) else str(exc)
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to save text: {exc.strerror or exc}",
+            detail=f"Failed to save text: {message or exc}",
         ) from exc
     return {"ok": True, "path": str(path)}
 
 
 @app.get("/paths")
-async def list_paths(prefix: str = "") -> dict[str, list[str]]:
+def list_paths(prefix: str = "") -> dict[str, list[str]]:
     try:
         config = load_config()
     except (RuntimeError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    save_root_expanded = config.save_root.expanduser()
+    save_root = config.save_root
     prefix = prefix.strip()
+    prefix_ends_with_separator = prefix.endswith(("/", "\\"))
 
     if prefix:
         candidate = Path(prefix).expanduser()
-        search_dir = candidate if candidate.is_absolute() else save_root_expanded / candidate
-        if (
-            prefix.endswith("/")
-            or prefix.endswith("\\")
-            or (
-                search_dir.is_dir()
-                and search_dir != save_root_expanded / candidate.parent
-            )
+        search_dir = candidate if candidate.is_absolute() else save_root / candidate
+        if not prefix_ends_with_separator and not (
+            search_dir.is_dir() and search_dir != save_root / candidate.parent
         ):
-            search_dir = search_dir if search_dir.is_dir() else search_dir.parent
-        else:
             search_dir = search_dir.parent
     else:
-        search_dir = save_root_expanded
+        search_dir = save_root
 
     clean = Path(os.path.normpath(str(search_dir)))
     try:
-        clean.relative_to(save_root_expanded)
+        clean.relative_to(save_root)
     except ValueError:
         return {"paths": []}
+    search_dir = clean
 
     if not search_dir.is_dir():
         return {"paths": []}
 
     prefix_lower = ""
-    if prefix:
+    if prefix and not prefix_ends_with_separator:
         raw_name = Path(prefix).name.lower()
         if raw_name and raw_name != "~":
             prefix_lower = raw_name
@@ -178,7 +230,7 @@ async def list_paths(prefix: str = "") -> dict[str, list[str]]:
         for entry in sorted(search_dir.iterdir()):
             if prefix_lower and not entry.name.lower().startswith(prefix_lower):
                 continue
-            relative_path = str(entry.relative_to(save_root_expanded))
+            relative_path = str(entry.relative_to(save_root))
             if entry.is_dir():
                 relative_path += "/"
             paths.append(relative_path)
@@ -190,7 +242,11 @@ async def list_paths(prefix: str = "") -> dict[str, list[str]]:
     return {"paths": paths}
 
 
+BIND_HOST = "127.0.0.1"
+
+
 if __name__ == "__main__":
     import uvicorn
+
     config = load_config()
-    uvicorn.run(app, host=config.host, port=config.port)
+    uvicorn.run(app, host=BIND_HOST, port=config.port)

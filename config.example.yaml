@@ -2,6 +2,8 @@
 # resolved under this root, and absolute paths must also stay inside it.
 save_root: "~"
 
-# Server bind address and port.
-host: "127.0.0.1"
+# Maximum UTF-8 encoded text size in bytes. Set to 0 for unlimited.
+max_text_bytes: 0
+
+# Server port (always binds to 127.0.0.1 only).
 port: 8766

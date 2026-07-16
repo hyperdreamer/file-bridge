@@ -23,7 +23,9 @@ The server listens on the address and port configured in `config.yaml` (default 
 ## API
 
 - `GET /health` returns service health.
-- `POST /save` accepts `{ "text": "...", "path": "notes/file.txt" }`.
+- `POST /save` accepts `{ "text": "...", "path": "notes/file.txt" }`. The
+  optional `max_text_bytes` setting limits the UTF-8 encoded text size; `0`
+  means unlimited. Requests over the configured limit return HTTP 413.
 - `GET /paths?prefix=notes/` returns up to 30 matching paths.
 
 ## Tests

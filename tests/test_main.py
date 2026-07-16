@@ -113,3 +113,20 @@ def test_health_returns_ok(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.json() == {"ok": True}
+
+
+def test_config_reads_host_and_port(tmp_path: Path) -> None:
+    import yaml
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.dump({"host": "0.0.0.0", "port": 9999}))
+    config = main.load_config(path=config_path)
+
+    assert config.host == "0.0.0.0"
+    assert config.port == 9999
+
+
+def test_config_defaults_host_and_port(tmp_path: Path) -> None:
+    config = main.load_config(path=tmp_path / "nonexistent.yaml")
+
+    assert config.host == "127.0.0.1"
+    assert config.port == 8766

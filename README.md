@@ -12,14 +12,13 @@ pip install -r requirements.txt
 cp config.example.yaml config.yaml
 ```
 
-Edit `config.yaml` if saves should be restricted to a directory other than the
-current user's home directory. Then start the service:
+Edit `config.yaml` to change the bind address, port, save root, or text limit.\nDefaults are safe (loopback-only). Then start the service:
 
 ```bash
 ./scripts/start.sh
 ```
 
-The server listens only on `127.0.0.1:8766`.
+The server listens on the address and port configured in `config.yaml` (default `127.0.0.1:8766`).
 
 ## API
 

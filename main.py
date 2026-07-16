@@ -31,6 +31,8 @@ class AppConfig:
 
     save_root: Path = Path(DEFAULT_SAVE_ROOT)
     max_text_chars: int = DEFAULT_MAX_TEXT_CHARS
+    host: str = "127.0.0.1"
+    port: int = 8766
 
 
 def _load_yaml_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
@@ -50,6 +52,8 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     return AppConfig(
         save_root=Path(str(raw_config.get("save_root", DEFAULT_SAVE_ROOT))).expanduser(),
         max_text_chars=int(raw_config.get("max_text_chars", DEFAULT_MAX_TEXT_CHARS)),
+        host=str(raw_config.get("host", "127.0.0.1")),
+        port=int(raw_config.get("port", 8766)),
     )
 
 
@@ -196,3 +200,9 @@ async def list_paths(prefix: str = "") -> dict[str, list[str]]:
         pass
 
     return {"paths": paths}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    config = load_config()
+    uvicorn.run(app, host=config.host, port=config.port)

@@ -15,7 +15,6 @@ from pydantic import BaseModel
 
 CONFIG_PATH = Path(__file__).with_name("config.yaml")
 DEFAULT_SAVE_ROOT = "~"
-DEFAULT_MAX_TEXT_CHARS = 200_000
 
 
 class SaveRequest(BaseModel):
@@ -30,7 +29,6 @@ class AppConfig:
     """Application settings loaded from config.yaml."""
 
     save_root: Path = Path(DEFAULT_SAVE_ROOT)
-    max_text_chars: int = DEFAULT_MAX_TEXT_CHARS
     host: str = "127.0.0.1"
     port: int = 8766
 
@@ -51,18 +49,9 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     raw_config = _load_yaml_config(path)
     return AppConfig(
         save_root=Path(str(raw_config.get("save_root", DEFAULT_SAVE_ROOT))).expanduser(),
-        max_text_chars=int(raw_config.get("max_text_chars", DEFAULT_MAX_TEXT_CHARS)),
         host=str(raw_config.get("host", "127.0.0.1")),
         port=int(raw_config.get("port", 8766)),
     )
-
-
-def _validate_text_size(text: str, config: AppConfig) -> None:
-    if len(text) > config.max_text_chars:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Text exceeds configured limit of {config.max_text_chars} characters",
-        )
 
 
 def _resolve_save_path(raw_path: str, config: AppConfig) -> Path:
@@ -130,7 +119,6 @@ async def save_text(request: SaveRequest) -> dict[str, str | bool]:
     except (RuntimeError, TypeError, ValueError) as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    _validate_text_size(request.text, config)
     path = _resolve_save_path(request.path, config)
 
     try:

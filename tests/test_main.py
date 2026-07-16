@@ -11,7 +11,7 @@ import main
 
 @pytest.fixture
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
-    config = main.AppConfig(save_root=tmp_path, max_text_chars=20)
+    config = main.AppConfig(save_root=tmp_path)
     monkeypatch.setattr(main, "load_config", lambda: config)
     return TestClient(main.app)
 
@@ -42,12 +42,6 @@ def test_save_rejects_paths_outside_save_root(client: TestClient, tmp_path: Path
 
     assert response.status_code == 400
     assert not (tmp_path.parent / "outside.txt").exists()
-
-
-def test_save_rejects_oversized_text(client: TestClient) -> None:
-    response = client.post("/save", json={"text": "x" * 21, "path": "large.txt"})
-
-    assert response.status_code == 413
 
 
 def test_save_atomic_failure_does_not_corrupt_existing_file(

@@ -2,9 +2,6 @@
 # resolved under this root, and absolute paths must also stay inside it.
 save_root: "~"
 
-# Maximum number of characters accepted by POST /save.
-max_text_chars: 200000
-
 # Server bind address and port.
 host: "127.0.0.1"
 port: 8766

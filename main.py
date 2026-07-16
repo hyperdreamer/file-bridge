@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 
+APPLICATION_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = Path(__file__).with_name("config.yaml")
 DEFAULT_SAVE_ROOT = "~"
 
@@ -75,6 +76,9 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     )
 
 
+RUNTIME_CONFIG = load_config()
+
+
 def _resolve_save_path(raw_path: str, config: AppConfig) -> Path:
     raw_path = raw_path.strip()
     if not raw_path:
@@ -95,7 +99,18 @@ def _resolve_save_path(raw_path: str, config: AppConfig) -> Path:
             detail=f"Save path must stay under configured save_root: {save_root}",
         ) from exc
 
-    return path.resolve()
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(APPLICATION_ROOT)
+    except ValueError:
+        pass
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot save inside the file-bridge application directory",
+        )
+
+    return resolved
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -137,10 +152,7 @@ app = FastAPI(title="File Bridge")
 
 @app.get("/health")
 def health() -> dict[str, bool]:
-    try:
-        config = load_config()
-    except (RuntimeError, TypeError, ValueError) as exc:
-        raise HTTPException(status_code=503, detail=f"Not ready: {exc}") from exc
+    config = RUNTIME_CONFIG
 
     if not config.save_root.is_dir() or not os.access(
         config.save_root, os.R_OK | os.W_OK | os.X_OK
@@ -154,10 +166,7 @@ def health() -> dict[str, bool]:
 
 @app.post("/save")
 def save_text(request: SaveRequest) -> dict[str, str | bool]:
-    try:
-        config = load_config()
-    except (RuntimeError, TypeError, ValueError) as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    config = RUNTIME_CONFIG
 
     if config.max_text_bytes > 0:
         try:
@@ -190,10 +199,7 @@ def save_text(request: SaveRequest) -> dict[str, str | bool]:
 
 @app.get("/paths")
 def list_paths(prefix: str = "") -> dict[str, list[str]]:
-    try:
-        config = load_config()
-    except (RuntimeError, TypeError, ValueError) as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    config = RUNTIME_CONFIG
 
     save_root = config.save_root
     prefix = prefix.strip()
@@ -248,5 +254,4 @@ BIND_HOST = "127.0.0.1"
 if __name__ == "__main__":
     import uvicorn
 
-    config = load_config()
-    uvicorn.run(app, host=BIND_HOST, port=config.port)
+    uvicorn.run(app, host=BIND_HOST, port=RUNTIME_CONFIG.port)

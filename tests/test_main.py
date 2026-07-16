@@ -14,7 +14,7 @@ import main
 @pytest.fixture
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     config = main.AppConfig(save_root=tmp_path)
-    monkeypatch.setattr(main, "load_config", lambda: config)
+    monkeypatch.setattr(main, "RUNTIME_CONFIG", config)
     return TestClient(main.app)
 
 
@@ -52,7 +52,7 @@ def test_save_allows_text_within_byte_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = main.AppConfig(save_root=tmp_path, max_text_bytes=2)
-    monkeypatch.setattr(main, "load_config", lambda: config)
+    monkeypatch.setattr(main, "RUNTIME_CONFIG", config)
     client = TestClient(main.app)
 
     response = client.post("/save", json={"text": "é", "path": "within.txt"})
@@ -65,7 +65,7 @@ def test_save_rejects_text_exceeding_byte_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = main.AppConfig(save_root=tmp_path, max_text_bytes=3)
-    monkeypatch.setattr(main, "load_config", lambda: config)
+    monkeypatch.setattr(main, "RUNTIME_CONFIG", config)
     client = TestClient(main.app)
 
     response = client.post("/save", json={"text": "éé", "path": "too-large.txt"})
@@ -81,7 +81,7 @@ def test_save_with_zero_limit_allows_large_text(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = main.AppConfig(save_root=tmp_path, max_text_bytes=0)
-    monkeypatch.setattr(main, "load_config", lambda: config)
+    monkeypatch.setattr(main, "RUNTIME_CONFIG", config)
     client = TestClient(main.app)
     text = "x" * 100_000
 
@@ -207,7 +207,7 @@ def test_health_returns_not_ready_for_missing_save_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     missing = tmp_path / "missing"
-    monkeypatch.setattr(main, "load_config", lambda: main.AppConfig(save_root=missing))
+    monkeypatch.setattr(main, "RUNTIME_CONFIG", main.AppConfig(save_root=missing))
 
     response = TestClient(main.app).get("/health")
 
@@ -219,7 +219,7 @@ def test_health_returns_not_ready_for_unwritable_save_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = main.AppConfig(save_root=tmp_path)
-    monkeypatch.setattr(main, "load_config", lambda: config)
+    monkeypatch.setattr(main, "RUNTIME_CONFIG", config)
     monkeypatch.setattr(main.os, "access", lambda _path, _mode: False)
 
     response = TestClient(main.app).get("/health")
@@ -228,18 +228,25 @@ def test_health_returns_not_ready_for_unwritable_save_root(
     assert "not an accessible directory" in response.json()["detail"]
 
 
-def test_health_returns_not_ready_for_invalid_config(
-    monkeypatch: pytest.MonkeyPatch,
+def test_overwriting_config_file_does_not_change_active_save_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def invalid_config() -> main.AppConfig:
-        raise RuntimeError("Unknown config key(s): typo")
+    active_root = tmp_path / "active"
+    changed_root = tmp_path / "changed"
+    active_root.mkdir()
+    changed_root.mkdir()
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(f'save_root: "{active_root}"\n', encoding="utf-8")
+    monkeypatch.setattr(main, "RUNTIME_CONFIG", main.load_config(config_path))
 
-    monkeypatch.setattr(main, "load_config", invalid_config)
+    config_path.write_text(f'save_root: "{changed_root}"\n', encoding="utf-8")
+    response = TestClient(main.app).post(
+        "/save", json={"text": "still active", "path": "runtime.txt"}
+    )
 
-    response = TestClient(main.app).get("/health")
-
-    assert response.status_code == 503
-    assert response.json() == {"detail": "Not ready: Unknown config key(s): typo"}
+    assert response.status_code == 200
+    assert (active_root / "runtime.txt").read_text(encoding="utf-8") == "still active"
+    assert not (changed_root / "runtime.txt").exists()
 
 
 def test_save_and_paths_handlers_are_synchronous() -> None:
@@ -311,7 +318,7 @@ def test_save_accepts_absolute_path_with_normalized_relative_root(
 ) -> None:
     save_root = tmp_path / "data" / ".." / "saves"
     config = main.AppConfig(save_root=save_root)
-    monkeypatch.setattr(main, "load_config", lambda: config)
+    monkeypatch.setattr(main, "RUNTIME_CONFIG", config)
     client = TestClient(main.app)
     target = tmp_path / "saves" / "absolute.txt"
 
@@ -319,3 +326,32 @@ def test_save_accepts_absolute_path_with_normalized_relative_root(
 
     assert response.status_code == 200
     assert target.read_text(encoding="utf-8") == "ok"
+
+
+@pytest.mark.parametrize("filename", ["config.yaml", "main.py"])
+def test_resolve_save_path_rejects_application_files(filename: str) -> None:
+    config = main.AppConfig(save_root=main.APPLICATION_ROOT.parent)
+
+    with pytest.raises(
+        main.HTTPException,
+        match="Cannot save inside the file-bridge application directory",
+    ) as exc_info:
+        main._resolve_save_path(str(main.APPLICATION_ROOT / filename), config)
+
+    assert exc_info.value.status_code == 400
+
+
+def test_resolve_save_path_rejects_symlink_into_application_directory(
+    tmp_path: Path,
+) -> None:
+    application_link = tmp_path / "application"
+    application_link.symlink_to(main.APPLICATION_ROOT, target_is_directory=True)
+    config = main.AppConfig(save_root=tmp_path)
+
+    with pytest.raises(
+        main.HTTPException,
+        match="Cannot save inside the file-bridge application directory",
+    ) as exc_info:
+        main._resolve_save_path(str(application_link / "main.py"), config)
+
+    assert exc_info.value.status_code == 400

@@ -12,13 +12,16 @@ pip install -r requirements.txt
 cp config.example.yaml config.yaml
 ```
 
-Edit `config.yaml` to change the bind address, port, or save root. Defaults are safe (loopback-only). Then start the service:
+Edit `config.yaml` to change the port, save root, or maximum text size. The
+service always binds to `127.0.0.1`. Configuration is loaded once at startup,
+so restart the service after making any changes. Then start the service:
 
 ```bash
 ./start.sh
 ```
 
-The server listens on the address and port configured in `config.yaml` (default `127.0.0.1:8766`).
+The server listens on `127.0.0.1` using the port configured in `config.yaml`
+(default `8766`).
 
 ## API
 

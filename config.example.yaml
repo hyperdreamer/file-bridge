@@ -1,0 +1,6 @@
+# Save requests are constrained to this directory. Relative save paths are
+# resolved under this root, and absolute paths must also stay inside it.
+save_root: "~"
+
+# Maximum number of characters accepted by POST /save.
+max_text_chars: 200000

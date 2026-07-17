@@ -5,6 +5,7 @@ import inspect
 import json
 import logging
 import os
+import socket
 import stat
 import time
 from collections.abc import Generator
@@ -798,6 +799,31 @@ def test_save_maps_existing_directory_conflict_to_400(client: TestClient, tmp_pa
     assert response.status_code == 400
     assert response.json() == {"detail": "Destination conflicts with an existing filesystem entry"}
     assert str(tmp_path) not in response.text
+
+
+def test_save_maps_existing_fifo_conflict_to_400(client: TestClient, tmp_path: Path) -> None:
+    destination = tmp_path / "destination"
+    os.mkfifo(destination)
+
+    response = client.post("/save", json={"text": "no", "path": "destination"})
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Destination conflicts with an existing filesystem entry"}
+    assert stat.S_ISFIFO(destination.stat().st_mode)
+
+
+def test_save_maps_existing_socket_conflict_to_400(client: TestClient, tmp_path: Path) -> None:
+    destination = tmp_path / "destination"
+    with socket.socket(socket.AF_UNIX) as unix_socket:
+        unix_socket.bind(str(destination))
+
+        response = client.post("/save", json={"text": "no", "path": "destination"})
+
+        assert response.status_code == 400
+        assert response.json() == {
+            "detail": "Destination conflicts with an existing filesystem entry"
+        }
+        assert stat.S_ISSOCK(destination.stat().st_mode)
 
 
 def test_save_maps_non_directory_parent_conflict_to_400(client: TestClient, tmp_path: Path) -> None:

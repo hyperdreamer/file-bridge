@@ -343,9 +343,17 @@ def _atomic_write_text(path: Path, text: str) -> str | None:
     temp_path: Path | None = None
     try:
         try:
-            destination_mode = stat.S_IMODE(path.stat().st_mode)
+            destination_stat = path.stat()
         except FileNotFoundError:
             destination_mode = None
+        else:
+            if not stat.S_ISREG(destination_stat.st_mode):
+                raise FileExistsError(
+                    errno.EEXIST,
+                    "Destination is not a regular file",
+                    path,
+                )
+            destination_mode = stat.S_IMODE(destination_stat.st_mode)
 
         with tempfile.NamedTemporaryFile(
             mode="w",

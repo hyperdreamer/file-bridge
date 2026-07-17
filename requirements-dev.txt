@@ -2,6 +2,7 @@
 
 httpx2==2.7.0
 mypy==2.1.0
+pip-tools==7.5.3
 pytest==9.1.1
 ruff==0.15.18
 types-PyYAML==6.0.12.20260518

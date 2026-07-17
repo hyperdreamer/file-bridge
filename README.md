@@ -8,7 +8,7 @@ filesystem path suggestions for TextKit.
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install --require-hashes -r requirements.lock
 cp config.example.yaml config.yaml
 ```
 
@@ -70,10 +70,22 @@ filesystem paths.
 
 ## Development and tests
 
-Runtime and test dependencies are pinned to exact versions. Install the test
-tools with:
+Runtime and test dependencies, including transitive dependencies, are pinned
+with artifact hashes. Install the test tools with:
 
 ```bash
-pip install -r requirements-dev.txt
+pip install --require-hashes -r requirements-dev.lock
 python -m pytest tests/ -v
+```
+
+`requirements.txt` and `requirements-dev.txt` are the human-edited inputs.
+After changing either file, regenerate the locks with:
+
+```bash
+pip-compile --allow-unsafe --generate-hashes --strip-extras \
+  --index-url https://pypi.org/simple \
+  --output-file requirements.lock requirements.txt
+pip-compile --allow-unsafe --generate-hashes --strip-extras \
+  --index-url https://pypi.org/simple \
+  --output-file requirements-dev.lock requirements-dev.txt
 ```

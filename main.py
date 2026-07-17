@@ -2,26 +2,49 @@
 
 from __future__ import annotations
 
+import argparse
 import bisect
+import contextvars
 import errno
+import json
 import logging
 import os
+import re
 import stat
 import tempfile
+import time
+import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import yaml
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict
+from starlette.responses import JSONResponse
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 
 APPLICATION_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = Path(__file__).with_name("config.yaml")
 DEFAULT_SAVE_ROOT = "~"
-LOGGER = logging.getLogger(__name__)
+DEFAULT_MAX_TEXT_BYTES = 1_048_576
+REQUEST_BODY_OVERHEAD_BYTES = 65_536
+BIND_HOST = "127.0.0.1"
+LOGGER = logging.getLogger("file_bridge")
+REQUEST_ID = contextvars.ContextVar("request_id", default="-")
+REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
 INVALID_PATH_ERRNOS = {errno.EINVAL, errno.ENAMETOOLONG}
+DESTINATION_CONFLICT_ERRNOS = {
+    errno.EEXIST,
+    errno.EISDIR,
+    errno.ELOOP,
+    errno.ENOTDIR,
+    errno.ENOTEMPTY,
+}
 
 
 class APIModel(BaseModel):
@@ -57,7 +80,7 @@ class AppConfig:
 
     save_root: Path = Path(DEFAULT_SAVE_ROOT)
     port: int = 8766
-    max_text_bytes: int = 0
+    max_text_bytes: int = DEFAULT_MAX_TEXT_BYTES
 
     def __post_init__(self) -> None:
         try:
@@ -67,12 +90,42 @@ class AppConfig:
         object.__setattr__(self, "save_root", save_root)
 
 
+class UniqueKeyLoader(yaml.SafeLoader):
+    """Safe YAML loader that refuses ambiguous duplicate mapping keys."""
+
+    def construct_mapping(
+        self, node: yaml.MappingNode, deep: bool = False
+    ) -> dict[Any, Any]:
+        self.flatten_mapping(node)
+        mapping: dict[Any, Any] = {}
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            try:
+                duplicate = key in mapping
+            except TypeError as exc:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found an unhashable mapping key",
+                    key_node.start_mark,
+                ) from exc
+            if duplicate:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate key {key!r}",
+                    key_node.start_mark,
+                )
+            mapping[key] = self.construct_object(value_node, deep=deep)
+        return mapping
+
+
 def _load_yaml_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     try:
         with path.open("r", encoding="utf-8") as config_file:
-            loaded = yaml.safe_load(config_file)
-    except FileNotFoundError:
-        return {}
+            loaded = yaml.load(config_file, Loader=UniqueKeyLoader)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Configuration file not found: {path}") from exc
     except (yaml.YAMLError, UnicodeError) as exc:
         raise RuntimeError(f"Invalid YAML in {path}: {exc}") from exc
     except OSError as exc:
@@ -101,6 +154,8 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     save_root = raw_config.get("save_root", DEFAULT_SAVE_ROOT)
     if not isinstance(save_root, str):
         raise RuntimeError("config save_root must be a non-null string")
+    if not save_root or save_root.isspace():
+        raise RuntimeError("config save_root must not be empty or whitespace-only")
 
     try:
         save_root_path = Path(save_root).expanduser()
@@ -115,7 +170,7 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     if not 1 <= port <= 65535:
         raise RuntimeError("config port must be from 1 to 65535")
 
-    max_text_bytes = raw_config.get("max_text_bytes", 0)
+    max_text_bytes = raw_config.get("max_text_bytes", DEFAULT_MAX_TEXT_BYTES)
     if type(max_text_bytes) is not int or max_text_bytes < 0:
         raise RuntimeError("config max_text_bytes must be a non-negative integer")
 
@@ -126,20 +181,24 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     )
 
 
-RUNTIME_CONFIG = load_config()
+RUNTIME_CONFIG: AppConfig | None = None
+READY = False
 
 
-def _invalid_path(exc: BaseException) -> HTTPException:
-    message = str(exc) or exc.__class__.__name__
-    return HTTPException(status_code=400, detail=f"Invalid path: {message}")
+def _get_runtime_config() -> AppConfig:
+    if RUNTIME_CONFIG is None:
+        raise HTTPException(status_code=503, detail="Service is not ready")
+    return RUNTIME_CONFIG
+
+
+def _invalid_path(_exc: BaseException | None = None) -> HTTPException:
+    return HTTPException(status_code=400, detail="Invalid path")
 
 
 def _validate_path_length(path: Path, save_root: Path) -> None:
     """Reject paths the target filesystem cannot represent before I/O."""
 
     try:
-        # The configured root may not exist yet (save creates parents), so
-        # query the nearest existing ancestor on the same filesystem.
         probe = save_root
         while not probe.exists() and probe != probe.parent:
             probe = probe.parent
@@ -150,8 +209,6 @@ def _validate_path_length(path: Path, save_root: Path) -> None:
     except (UnicodeError, ValueError) as exc:
         raise _invalid_path(exc) from exc
     except OSError:
-        # Filesystems without pathconf support are left to the actual I/O
-        # operation, whose ENAMETOOLONG/EINVAL errors are mapped to HTTP 400.
         return
 
     if path_max != -1 and len(encoded_path) >= path_max:
@@ -177,32 +234,31 @@ def _expand_user_path(raw_path: str, save_root: Path) -> Path:
     return clean
 
 
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
 def _resolve_save_path(raw_path: str, config: AppConfig) -> Path:
-    raw_path = raw_path.strip()
-    if not raw_path:
+    if not raw_path or raw_path.isspace():
         raise HTTPException(status_code=400, detail="Missing save path")
 
     save_root = config.save_root
-    # Collapse ``..`` without resolving symlinks for the containment check, so
-    # paths such as ~/Ramdisk remain usable by design.
     clean = _expand_user_path(raw_path, save_root)
-    try:
-        clean.relative_to(save_root)
-    except ValueError as exc:
+    if not _is_within(clean, save_root):
         raise HTTPException(
             status_code=400,
-            detail=f"Save path must stay under configured save_root: {save_root}",
-        ) from exc
+            detail="Save path must stay under configured save_root",
+        )
 
     try:
         resolved = clean.resolve()
     except (OSError, RuntimeError, ValueError) as exc:
         raise _invalid_path(exc) from exc
-    try:
-        resolved.relative_to(APPLICATION_ROOT)
-    except ValueError:
-        pass
-    else:
+    if _is_within(resolved, APPLICATION_ROOT):
         raise HTTPException(
             status_code=400,
             detail="Cannot save inside the file-bridge application directory",
@@ -211,36 +267,86 @@ def _resolve_save_path(raw_path: str, config: AppConfig) -> Path:
     return resolved
 
 
+def _durability_warning() -> str:
+    return "Durability sync failed; saved data may not survive a crash"
+
+
 def _fsync_directory(path: Path) -> str | None:
-    """Best-effort directory sync after a file replacement has committed."""
+    """Best-effort directory sync after a filesystem entry changes."""
 
     directory_fd: int | None = None
     try:
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         directory_fd = os.open(path, flags)
         os.fsync(directory_fd)
-    except OSError as exc:
-        warning = f"File saved, but directory durability sync failed: {exc}"
-        LOGGER.warning("%s", warning, exc_info=True)
-        return warning
+    except OSError:
+        LOGGER.warning(
+            "directory durability sync failed",
+            exc_info=True,
+            extra={"event": "directory_fsync_failed", "filesystem_path": str(path)},
+        )
+        return _durability_warning()
     finally:
         if directory_fd is not None:
             try:
                 os.close(directory_fd)
             except OSError:
-                LOGGER.warning("Failed to close directory after fsync: %s", path)
+                LOGGER.warning(
+                    "failed to close directory after fsync",
+                    exc_info=True,
+                    extra={"event": "directory_close_failed"},
+                )
     return None
 
 
+def _ensure_parent_directories(path: Path) -> list[str]:
+    """Create missing parents and sync each directory entry creation."""
+
+    missing: list[Path] = []
+    current = path
+    while True:
+        try:
+            current.stat()
+        except FileNotFoundError:
+            missing.append(current)
+            if current == current.parent:
+                break
+            current = current.parent
+        else:
+            if not current.is_dir():
+                raise NotADirectoryError(
+                    errno.ENOTDIR, "A parent component is not a directory"
+                )
+            break
+
+    warnings: list[str] = []
+    for directory in reversed(missing):
+        try:
+            directory.mkdir()
+        except FileExistsError:
+            if not directory.is_dir():
+                raise
+            continue
+        warning = _fsync_directory(directory.parent)
+        if warning:
+            warnings.append(warning)
+    return warnings
+
+
 def _atomic_write_text(path: Path, text: str) -> str | None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    warnings = _ensure_parent_directories(path.parent)
     temp_path: Path | None = None
     try:
+        try:
+            destination_mode = stat.S_IMODE(path.stat().st_mode)
+        except FileNotFoundError:
+            destination_mode = None
+
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
             dir=path.parent,
-            prefix=f".{path.name}.",
+            prefix=".file-bridge-",
             suffix=".tmp",
             delete=False,
         ) as temp_file:
@@ -248,66 +354,217 @@ def _atomic_write_text(path: Path, text: str) -> str | None:
             temp_file.write(text)
             temp_file.flush()
             os.fsync(temp_file.fileno())
-
-        try:
-            destination_mode = stat.S_IMODE(path.stat().st_mode)
-        except FileNotFoundError:
-            pass
-        else:
-            os.chmod(temp_path, destination_mode)
+            if destination_mode is not None:
+                os.fchmod(temp_file.fileno(), destination_mode)
+                os.fsync(temp_file.fileno())
 
         os.replace(temp_path, path)
         temp_path = None
-        return _fsync_directory(path.parent)
+        warning = _fsync_directory(path.parent)
+        if warning:
+            warnings.append(warning)
+        return warnings[0] if warnings else None
     finally:
         if temp_path is not None:
             try:
                 temp_path.unlink(missing_ok=True)
             except OSError:
-                pass
-
-
-app = FastAPI(title="File Bridge")
+                LOGGER.warning(
+                    "failed to remove temporary save file",
+                    exc_info=True,
+                    extra={"event": "temp_cleanup_failed"},
+                )
 
 
 def _probe_save_root(save_root: Path) -> None:
-    root_stat = save_root.stat()
+    try:
+        root_stat = save_root.stat()
+    except FileNotFoundError as exc:
+        raise RuntimeError("save_root does not exist") from exc
+    except OSError as exc:
+        raise RuntimeError("save_root cannot be accessed") from exc
     if not stat.S_ISDIR(root_stat.st_mode):
-        raise NotADirectoryError(errno.ENOTDIR, "Not a directory", str(save_root))
+        raise RuntimeError("save_root is not a directory")
 
-    with os.scandir(save_root) as entries:
-        next(entries, None)
-    with tempfile.TemporaryFile(dir=save_root):
-        pass
+    try:
+        with os.scandir(save_root) as entries:
+            next(entries, None)
+        with tempfile.TemporaryFile(dir=save_root):
+            pass
+    except OSError as exc:
+        raise RuntimeError("save_root must be readable and writable") from exc
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    global READY, RUNTIME_CONFIG
+
+    config = RUNTIME_CONFIG if RUNTIME_CONFIG is not None else load_config()
+    try:
+        _probe_save_root(config.save_root)
+    except RuntimeError as exc:
+        LOGGER.critical(
+            "startup validation failed: %s",
+            exc,
+            exc_info=True,
+            extra={
+                "event": "startup_failed",
+                "filesystem_path": str(config.save_root),
+            },
+        )
+        raise RuntimeError(f"Startup validation failed: {exc}") from exc
+
+    RUNTIME_CONFIG = config
+    READY = True
+    LOGGER.info(
+        "file-bridge is ready",
+        extra={
+            "event": "startup_complete",
+            "filesystem_path": str(config.save_root),
+            "port": config.port,
+        },
+    )
+    try:
+        yield
+    finally:
+        READY = False
+        LOGGER.info("file-bridge stopped", extra={"event": "shutdown_complete"})
+
+
+def _request_body_limit(config: AppConfig) -> int:
+    text_limit = config.max_text_bytes or DEFAULT_MAX_TEXT_BYTES
+    return text_limit * 6 + REQUEST_BODY_OVERHEAD_BYTES
+
+
+def _header_value(scope: Scope, name: bytes) -> str | None:
+    for header_name, value in scope.get("headers", []):
+        if header_name.lower() == name:
+            return value.decode("latin-1")
+    return None
+
+
+class RequestMiddleware:
+    """Attach request IDs, log requests, and bound bodies before parsing."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        request_id = _header_value(scope, b"x-request-id")
+        if request_id is None or REQUEST_ID_PATTERN.fullmatch(request_id) is None:
+            request_id = uuid.uuid4().hex
+        token = REQUEST_ID.set(request_id)
+        started = time.monotonic()
+        status_code = 500
+
+        async def send_with_request_id(message: Message) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+                headers = list(message.get("headers", []))
+                headers.append((b"x-request-id", request_id.encode("ascii")))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        try:
+            config = _get_runtime_config()
+            max_body_bytes = _request_body_limit(config)
+            content_length = _header_value(scope, b"content-length")
+            if content_length is not None:
+                try:
+                    declared_length = int(content_length)
+                except ValueError:
+                    declared_length = 0
+                if declared_length > max_body_bytes:
+                    status_code = 413
+                    response = JSONResponse(
+                        status_code=413,
+                        content={"detail": "Request body is too large"},
+                    )
+                    await response(scope, receive, send_with_request_id)
+                    return
+
+            messages: list[Message] = []
+            received_bytes = 0
+            while True:
+                message = await receive()
+                messages.append(message)
+                if message["type"] != "http.request":
+                    break
+                received_bytes += len(message.get("body", b""))
+                if received_bytes > max_body_bytes:
+                    status_code = 413
+                    response = JSONResponse(
+                        status_code=413,
+                        content={"detail": "Request body is too large"},
+                    )
+                    await response(scope, receive, send_with_request_id)
+                    return
+                if not message.get("more_body", False):
+                    break
+
+            async def replay_receive() -> Message:
+                if messages:
+                    return messages.pop(0)
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            await self.app(scope, replay_receive, send_with_request_id)
+        finally:
+            duration_ms = round((time.monotonic() - started) * 1000, 3)
+            LOGGER.info(
+                "request complete",
+                extra={
+                    "event": "request_complete",
+                    "method": scope.get("method"),
+                    "request_path": scope.get("path"),
+                    "status_code": status_code,
+                    "duration_ms": duration_ms,
+                },
+            )
+            REQUEST_ID.reset(token)
+
+
+app = FastAPI(title="File Bridge", lifespan=lifespan)
+app.add_middleware(RequestMiddleware)
 
 
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
-    config = RUNTIME_CONFIG
+    return HealthResponse(ok=True)
 
+
+@app.get("/ready", response_model=HealthResponse)
+def readiness() -> HealthResponse:
+    if not READY:
+        raise HTTPException(status_code=503, detail="Service is not ready")
+    config = _get_runtime_config()
     try:
         _probe_save_root(config.save_root)
-    except OSError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Not ready: save_root is not an accessible directory: "
-                f"{config.save_root}: {exc}"
-            ),
-        ) from exc
+    except RuntimeError as exc:
+        LOGGER.warning(
+            "readiness probe failed: %s",
+            exc,
+            exc_info=True,
+            extra={"event": "readiness_failed"},
+        )
+        raise HTTPException(status_code=503, detail="Service is not ready") from exc
     return HealthResponse(ok=True)
 
 
 @app.post("/save", response_model=SaveResponse, response_model_exclude_none=True)
 def save_text(request: SaveRequest) -> SaveResponse:
-    config = RUNTIME_CONFIG
+    config = _get_runtime_config()
 
     if config.max_text_bytes > 0:
         try:
             text_bytes = len(request.text.encode("utf-8"))
         except UnicodeEncodeError as exc:
             raise HTTPException(
-                status_code=400, detail=f"Text cannot be encoded as UTF-8: {exc}"
+                status_code=400, detail="Text cannot be encoded as UTF-8"
             ) from exc
         if text_bytes > config.max_text_bytes:
             raise HTTPException(
@@ -324,29 +581,34 @@ def save_text(request: SaveRequest) -> SaveResponse:
         warning = _atomic_write_text(path, request.text)
     except UnicodeEncodeError as exc:
         raise HTTPException(
-            status_code=400, detail=f"Text cannot be encoded as UTF-8: {exc}"
+            status_code=400, detail="Text cannot be encoded as UTF-8"
         ) from exc
     except OSError as exc:
         if exc.errno in INVALID_PATH_ERRNOS:
             raise _invalid_path(exc) from exc
-        LOGGER.exception("Failed to save text to %s", path)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to save text: {exc.strerror or exc}",
-        ) from exc
+        if exc.errno in DESTINATION_CONFLICT_ERRNOS:
+            raise HTTPException(
+                status_code=400,
+                detail="Destination conflicts with an existing filesystem entry",
+            ) from exc
+        LOGGER.exception(
+            "failed to save text",
+            extra={"event": "save_failed", "filesystem_path": str(path)},
+        )
+        raise HTTPException(status_code=500, detail="Failed to save text") from exc
     return SaveResponse(ok=True, path=str(path), warning=warning)
 
 
 @app.get("/paths", response_model=PathsResponse)
 def list_paths(prefix: str = "") -> PathsResponse:
-    config = RUNTIME_CONFIG
-
+    config = _get_runtime_config()
     save_root = config.save_root
-    prefix = prefix.strip()
     prefix_ends_with_separator = prefix.endswith("/")
 
     if prefix:
         search_dir = _expand_user_path(prefix, save_root)
+        if not _is_within(search_dir, save_root):
+            return PathsResponse(paths=[])
         try:
             exact_directory = search_dir.is_dir()
         except OSError as exc:
@@ -359,11 +621,14 @@ def list_paths(prefix: str = "") -> PathsResponse:
         search_dir = save_root
 
     try:
-        search_dir.relative_to(save_root)
-    except ValueError:
+        resolved_search_dir = search_dir.resolve()
+    except (OSError, RuntimeError, ValueError):
         return PathsResponse(paths=[])
-
-    if not search_dir.is_dir():
+    if not _is_within(resolved_search_dir, save_root):
+        return PathsResponse(paths=[])
+    if _is_within(resolved_search_dir, APPLICATION_ROOT):
+        return PathsResponse(paths=[])
+    if not resolved_search_dir.is_dir():
         return PathsResponse(paths=[])
 
     prefix_lower = ""
@@ -374,15 +639,22 @@ def list_paths(prefix: str = "") -> PathsResponse:
 
     paths: list[tuple[str, bool]] = []
     try:
-        with os.scandir(search_dir) as entries:
+        with os.scandir(resolved_search_dir) as entries:
             for entry in entries:
                 if prefix_lower and not entry.name.lower().startswith(prefix_lower):
                     continue
                 try:
-                    is_directory = entry.is_dir()
-                except OSError as exc:
+                    resolved_entry = Path(entry.path).resolve()
+                    if not _is_within(resolved_entry, save_root):
+                        continue
+                    if _is_within(resolved_entry, APPLICATION_ROOT):
+                        continue
+                    is_directory = resolved_entry.is_dir()
+                except (OSError, RuntimeError):
                     LOGGER.warning(
-                        "Cannot inspect path suggestion %s: %s", entry.path, exc
+                        "cannot inspect path suggestion",
+                        exc_info=True,
+                        extra={"event": "path_inspection_failed"},
                     )
                     continue
                 bisect.insort(paths, (entry.name, is_directory))
@@ -391,7 +663,11 @@ def list_paths(prefix: str = "") -> PathsResponse:
     except OSError as exc:
         if exc.errno in INVALID_PATH_ERRNOS:
             raise _invalid_path(exc) from exc
-        LOGGER.warning("Cannot list path suggestions in %s: %s", search_dir, exc)
+        LOGGER.warning(
+            "cannot list path suggestions",
+            exc_info=True,
+            extra={"event": "path_listing_failed"},
+        )
         return PathsResponse(paths=[])
 
     relative_directory = search_dir.relative_to(save_root)
@@ -404,10 +680,87 @@ def list_paths(prefix: str = "") -> PathsResponse:
     return PathsResponse(paths=results)
 
 
-BIND_HOST = "127.0.0.1"
+class JsonLogFormatter(logging.Formatter):
+    """Render application logs as one JSON object per line."""
+
+    EXTRA_FIELDS = (
+        "duration_ms",
+        "event",
+        "filesystem_path",
+        "method",
+        "port",
+        "request_path",
+        "status_code",
+    )
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, Any] = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "request_id": REQUEST_ID.get(),
+        }
+        for field in self.EXTRA_FIELDS:
+            value = getattr(record, field, None)
+            if value is not None:
+                payload[field] = value
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
+
+
+def configure_logging(*, force: bool = False) -> None:
+    handler = logging.StreamHandler()
+    handler.setFormatter(JsonLogFormatter())
+    root_logger = logging.getLogger()
+    if force or not root_logger.handlers:
+        root_logger.handlers.clear()
+        root_logger.addHandler(handler)
+    root_logger.setLevel(logging.INFO)
+
+
+def _validated_config(path: Path = CONFIG_PATH) -> AppConfig:
+    config = load_config(path)
+    _probe_save_root(config.save_root)
+    return config
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run the local file-bridge service")
+    parser.add_argument(
+        "--check-config",
+        action="store_true",
+        help="validate config.yaml and save_root, then exit",
+    )
+    args = parser.parse_args()
+    configure_logging(force=True)
+
+    global RUNTIME_CONFIG
+    try:
+        RUNTIME_CONFIG = _validated_config()
+    except RuntimeError as exc:
+        LOGGER.critical(
+            "startup configuration error: %s",
+            exc,
+            extra={"event": "startup_failed"},
+        )
+        return 2
+
+    if args.check_config:
+        LOGGER.info("configuration is valid", extra={"event": "config_valid"})
+        return 0
+
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host=BIND_HOST,
+        port=RUNTIME_CONFIG.port,
+        log_config=None,
+    )
+    return 0
 
 
 if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(app, host=BIND_HOST, port=RUNTIME_CONFIG.port)
+    raise SystemExit(main())

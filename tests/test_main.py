@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import errno
 import inspect
+import json
+import logging
 import stat
 from pathlib import Path
 
@@ -106,7 +108,7 @@ def test_save_atomic_failure_does_not_corrupt_existing_file(
 
     assert response.status_code == 500
     assert target.read_text(encoding="utf-8") == "original"
-    assert list(tmp_path.glob(".existing.txt.*.tmp")) == []
+    assert list(tmp_path.glob(".file-bridge-*.tmp")) == []
 
 
 def test_save_encoding_failure_removes_temp_file(
@@ -122,7 +124,7 @@ def test_save_encoding_failure_removes_temp_file(
 
     assert response.status_code == 400
     assert not (tmp_path / "invalid-encoding.txt").exists()
-    assert list(tmp_path.glob(".invalid-encoding.txt.*.tmp")) == []
+    assert list(tmp_path.glob(".file-bridge-*.tmp")) == []
 
 
 def test_save_overwrite_preserves_existing_permissions(
@@ -159,7 +161,7 @@ def test_save_returns_success_when_directory_fsync_fails(
 
     assert response.status_code == 200
     assert response.json()["ok"] is True
-    assert "durability sync failed" in response.json()["warning"]
+    assert "durability sync failed" in response.json()["warning"].lower()
     assert (tmp_path / "durable.txt").read_text(encoding="utf-8") == "saved"
 
 
@@ -236,35 +238,37 @@ def test_health_returns_ok(client: TestClient) -> None:
     assert response.json() == {"ok": True}
 
 
-def test_health_returns_not_ready_for_missing_save_root(
+def test_startup_fails_for_missing_save_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     missing = tmp_path / "missing"
     monkeypatch.setattr(main, "RUNTIME_CONFIG", main.AppConfig(save_root=missing))
 
-    with TestClient(main.app) as client:
-        response = client.get("/health")
-
-    assert response.status_code == 503
-    assert "not an accessible directory" in response.json()["detail"]
+    with pytest.raises(RuntimeError, match="save_root does not exist"):
+        with TestClient(main.app):
+            pass
 
 
-def test_health_returns_not_ready_for_unwritable_save_root(
+def test_liveness_and_readiness_are_separate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config = main.AppConfig(save_root=tmp_path)
     monkeypatch.setattr(main, "RUNTIME_CONFIG", config)
-    monkeypatch.setattr(
-        main,
-        "_probe_save_root",
-        lambda _path: (_ for _ in ()).throw(PermissionError("denied")),
-    )
 
     with TestClient(main.app) as client:
-        response = client.get("/health")
+        monkeypatch.setattr(
+            main,
+            "_probe_save_root",
+            lambda _path: (_ for _ in ()).throw(RuntimeError("denied")),
+        )
+        health_response = client.get("/health")
+        ready_response = client.get("/ready")
 
-    assert response.status_code == 503
-    assert "not an accessible directory" in response.json()["detail"]
+    assert health_response.status_code == 200
+    assert health_response.json() == {"ok": True}
+    assert ready_response.status_code == 503
+    assert ready_response.json() == {"detail": "Service is not ready"}
+    assert str(tmp_path) not in ready_response.text
 
 
 def test_overwriting_config_file_does_not_change_active_save_root(
@@ -306,10 +310,12 @@ def test_config_reads_port(tmp_path: Path) -> None:
 
 
 def test_config_defaults_port(tmp_path: Path) -> None:
-    config = main.load_config(path=tmp_path / "nonexistent.yaml")
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("", encoding="utf-8")
+    config = main.load_config(path=config_path)
 
     assert config.port == 8766
-    assert config.max_text_bytes == 0
+    assert config.max_text_bytes == main.DEFAULT_MAX_TEXT_BYTES
     assert config.save_root == Path("~").expanduser().resolve()
 
 
@@ -407,6 +413,7 @@ def test_save_accepts_absolute_path_with_normalized_relative_root(
     config = main.AppConfig(save_root=save_root)
     monkeypatch.setattr(main, "RUNTIME_CONFIG", config)
     target = tmp_path / "saves" / "absolute.txt"
+    target.parent.mkdir()
 
     with TestClient(main.app) as client:
         response = client.post("/save", json={"text": "ok", "path": str(target)})
@@ -471,3 +478,281 @@ def test_save_rejects_extra_request_fields(client: TestClient) -> None:
     )
 
     assert response.status_code == 422
+
+
+def test_paths_excludes_symlinks_that_escape_save_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save_root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    save_root.mkdir()
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+    (save_root / "escape").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(main, "RUNTIME_CONFIG", main.AppConfig(save_root=save_root))
+
+    with TestClient(main.app) as client:
+        root_response = client.get("/paths")
+        escaped_response = client.get("/paths", params={"prefix": "escape/"})
+
+    assert root_response.status_code == 200
+    assert root_response.json() == {"paths": []}
+    assert escaped_response.status_code == 200
+    assert escaped_response.json() == {"paths": []}
+
+
+def test_paths_preserves_safe_internal_symlink_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save_root = tmp_path / "root"
+    target = save_root / "target"
+    target.mkdir(parents=True)
+    (target / "note.txt").write_text("note", encoding="utf-8")
+    (save_root / "alias").symlink_to(target, target_is_directory=True)
+    monkeypatch.setattr(main, "RUNTIME_CONFIG", main.AppConfig(save_root=save_root))
+
+    with TestClient(main.app) as client:
+        response = client.get("/paths", params={"prefix": "alias/"})
+
+    assert response.status_code == 200
+    assert response.json() == {"paths": ["alias/note.txt"]}
+
+
+def test_paths_excludes_application_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    save_root = main.APPLICATION_ROOT.parent
+    monkeypatch.setattr(main, "RUNTIME_CONFIG", main.AppConfig(save_root=save_root))
+
+    with TestClient(main.app) as client:
+        response = client.get("/paths")
+
+    assert response.status_code == 200
+    assert f"{main.APPLICATION_ROOT.name}/" not in response.json()["paths"]
+
+
+def test_request_body_limit_rejects_before_json_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = main.AppConfig(save_root=tmp_path, max_text_bytes=1)
+    monkeypatch.setattr(main, "RUNTIME_CONFIG", config)
+    oversized_malformed_json = b"{" + b"x" * main._request_body_limit(config)
+
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/save",
+            content=oversized_malformed_json,
+            headers={"Content-Type": "application/json"},
+        )
+
+    assert response.status_code == 413
+    assert response.json() == {"detail": "Request body is too large"}
+
+
+def test_missing_config_file_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="Configuration file not found"):
+        main.load_config(tmp_path / "missing.yaml")
+
+
+@pytest.mark.parametrize("save_root", ["''", '""', "'   '", '"\t"'])
+def test_config_rejects_empty_or_whitespace_save_root(
+    tmp_path: Path, save_root: str
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(f"save_root: {save_root}\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="empty or whitespace-only"):
+        main.load_config(config_path)
+
+
+def test_config_rejects_duplicate_top_level_keys(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f'save_root: "{tmp_path}"\nsave_root: "/tmp"\n', encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="duplicate key 'save_root'"):
+        main.load_config(config_path)
+
+
+def test_config_rejects_duplicate_nested_mapping_keys(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        f'save_root: "{tmp_path}"\nunknown:\n  key: 1\n  key: 2\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="duplicate key 'key'"):
+        main.load_config(config_path)
+
+
+def test_startup_rejects_save_root_that_is_not_a_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save_root = tmp_path / "file.txt"
+    save_root.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setattr(main, "RUNTIME_CONFIG", main.AppConfig(save_root=save_root))
+
+    with pytest.raises(RuntimeError, match="save_root is not a directory"):
+        with TestClient(main.app):
+            pass
+
+
+def test_startup_rejects_inaccessible_save_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(main, "RUNTIME_CONFIG", main.AppConfig(save_root=tmp_path))
+    monkeypatch.setattr(
+        main,
+        "_probe_save_root",
+        lambda _path: (_ for _ in ()).throw(
+            RuntimeError("save_root must be readable and writable")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="readable and writable"):
+        with TestClient(main.app):
+            pass
+
+
+def test_save_supports_maximum_length_filename(
+    client: TestClient, tmp_path: Path
+) -> None:
+    name_max = main.os.pathconf(tmp_path, "PC_NAME_MAX")
+    if name_max == -1:
+        pytest.skip("filesystem does not report NAME_MAX")
+    filename = "n" * name_max
+
+    response = client.post("/save", json={"text": "long", "path": filename})
+
+    assert response.status_code == 200
+    assert (tmp_path / filename).read_text(encoding="utf-8") == "long"
+    assert list(tmp_path.glob(".file-bridge-*.tmp")) == []
+
+
+def test_overwrite_fsyncs_after_permission_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "existing.txt"
+    target.write_text("old", encoding="utf-8")
+    events: list[str] = []
+    real_fsync = main.os.fsync
+    real_fchmod = main.os.fchmod
+
+    def recording_fsync(file_descriptor: int) -> None:
+        events.append("fsync")
+        real_fsync(file_descriptor)
+
+    def recording_fchmod(file_descriptor: int, mode: int) -> None:
+        events.append("fchmod")
+        real_fchmod(file_descriptor, mode)
+
+    monkeypatch.setattr(main.os, "fsync", recording_fsync)
+    monkeypatch.setattr(main.os, "fchmod", recording_fchmod)
+
+    main._atomic_write_text(target, "new")
+
+    chmod_index = events.index("fchmod")
+    assert events[chmod_index - 1] == "fsync"
+    assert events[chmod_index + 1] == "fsync"
+
+
+def test_new_parent_directories_are_fsynced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    synced: list[Path] = []
+
+    def record_directory_sync(path: Path) -> None:
+        synced.append(path)
+        return None
+
+    monkeypatch.setattr(main, "_fsync_directory", record_directory_sync)
+    target = tmp_path / "one" / "two" / "file.txt"
+
+    main._atomic_write_text(target, "durable")
+
+    assert synced == [tmp_path, tmp_path / "one", tmp_path / "one" / "two"]
+
+
+def test_save_maps_existing_directory_conflict_to_400(
+    client: TestClient, tmp_path: Path
+) -> None:
+    (tmp_path / "destination").mkdir()
+
+    response = client.post(
+        "/save", json={"text": "no", "path": "destination"}
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": "Destination conflicts with an existing filesystem entry"
+    }
+    assert str(tmp_path) not in response.text
+
+
+def test_save_maps_non_directory_parent_conflict_to_400(
+    client: TestClient, tmp_path: Path
+) -> None:
+    (tmp_path / "parent").write_text("file", encoding="utf-8")
+
+    response = client.post(
+        "/save", json={"text": "no", "path": "parent/child.txt"}
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": "Destination conflicts with an existing filesystem entry"
+    }
+    assert str(tmp_path) not in response.text
+
+
+def test_save_rejects_whitespace_only_path(client: TestClient) -> None:
+    response = client.post("/save", json={"text": "no", "path": " \t "})
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Missing save path"}
+
+
+def test_save_preserves_nonempty_path_whitespace(
+    client: TestClient, tmp_path: Path
+) -> None:
+    filename = " spaced name.txt "
+
+    response = client.post("/save", json={"text": "exact", "path": filename})
+
+    assert response.status_code == 200
+    assert (tmp_path / filename).read_text(encoding="utf-8") == "exact"
+    assert not (tmp_path / filename.strip()).exists()
+
+
+def test_request_id_is_returned_and_invalid_values_are_replaced(
+    client: TestClient,
+) -> None:
+    supplied = client.get("/health", headers={"X-Request-ID": "client-123"})
+    invalid = client.get("/health", headers={"X-Request-ID": "contains spaces"})
+
+    assert supplied.headers["x-request-id"] == "client-123"
+    assert main.REQUEST_ID_PATTERN.fullmatch(invalid.headers["x-request-id"])
+    assert invalid.headers["x-request-id"] != "contains spaces"
+
+
+def test_json_log_formatter_includes_structured_request_context() -> None:
+    record = logging.LogRecord(
+        name="file_bridge",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="request complete",
+        args=(),
+        exc_info=None,
+    )
+    record.event = "request_complete"
+    record.status_code = 200
+    token = main.REQUEST_ID.set("request-42")
+    try:
+        payload = json.loads(main.JsonLogFormatter().format(record))
+    finally:
+        main.REQUEST_ID.reset(token)
+
+    assert payload["message"] == "request complete"
+    assert payload["event"] == "request_complete"
+    assert payload["request_id"] == "request-42"
+    assert payload["status_code"] == 200

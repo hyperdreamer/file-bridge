@@ -12,36 +12,63 @@ pip install -r requirements.txt
 cp config.example.yaml config.yaml
 ```
 
-Edit `config.yaml` to change the port, save root, or maximum text size. The
-service always binds to `127.0.0.1`. Configuration is loaded once at startup,
-so restart the service after making any changes. Then start the service:
+Edit `config.yaml` before starting the service. The file is required, is loaded
+once at startup, and rejects unknown or duplicate YAML keys. `save_root` must be
+non-empty and must already be an accessible, readable, writable directory. A
+relative `save_root` is resolved relative to the configuration file.
+
+Start the service with:
 
 ```bash
 ./start.sh
 ```
 
-The server listens on `127.0.0.1` using the port configured in `config.yaml`
-(default `8766`).
+The server always binds to `127.0.0.1` and uses the configured port (default
+`8766`). `start.sh` checks the virtual environment, configuration file, and
+save root first, then prints actionable diagnostics if startup cannot proceed.
 
-Relative `save_root` values are resolved relative to the directory containing
-the configuration file. Atomic overwrites preserve the existing Unix mode
-bits; other metadata such as timestamps, ACLs, and extended attributes is not
-preserved.
+## Configuration and limits
+
+The default `max_text_bytes` is 1 MiB. It limits the UTF-8 encoded text after
+JSON decoding. The server also rejects an oversized raw request body before
+JSON parsing; its allowance includes bounded space for JSON escaping and the
+request envelope. Setting `max_text_bytes` to `0` disables only the decoded-text
+check—the raw request body remains capped using the conservative 1 MiB default.
+
+Atomic overwrites preserve existing Unix mode bits. New parent directories,
+file data, permission changes, and the final directory entry are synced for
+crash durability. Other metadata such as timestamps, ACLs, and extended
+attributes is not preserved. A successful response may include a warning if a
+filesystem does not support a requested durability sync.
 
 ## API
 
-- `GET /health` returns service health.
-- `POST /save` accepts `{ "text": "...", "path": "notes/file.txt" }`. The
-  optional `max_text_bytes` setting limits the UTF-8 encoded text size; `0`
-  means unlimited. Requests over the configured limit return HTTP 413.
+- `GET /health` is a liveness check and returns `200` while the process serves
+  requests.
+- `GET /ready` verifies that the configured save root remains accessible and
+  returns `503` when the service is not ready.
+- `POST /save` accepts `{ "text": "...", "path": "notes/file.txt" }`.
 - `GET /paths?prefix=notes/` returns up to 30 matching paths.
 
-Request bodies reject unknown fields. Invalid paths (including NUL bytes,
-unknown `~user` expansions, and paths too long for the filesystem) return
-HTTP 400.
+`/paths` never follows suggestions outside `save_root` or into the file-bridge
+application directory. Request bodies reject unknown fields. Empty and
+whitespace-only save paths are invalid; leading or trailing whitespace on a
+non-empty filename is preserved rather than silently stripped. Invalid paths,
+including destination type conflicts, return HTTP 400. Oversized requests
+return HTTP 413.
 
-## Tests
+Every response includes `X-Request-ID`. Clients may supply an ID containing
+ASCII letters, digits, `.`, `_`, or `-`; otherwise the service generates one.
+Application logs are newline-delimited JSON and include the request ID, status,
+latency, and event name. Error responses do not disclose internal absolute
+filesystem paths.
+
+## Development and tests
+
+Runtime and test dependencies are pinned to exact versions. Install the test
+tools with:
 
 ```bash
+pip install -r requirements-dev.txt
 python -m pytest tests/ -v
 ```

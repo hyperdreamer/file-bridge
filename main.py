@@ -18,6 +18,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,8 @@ CONFIG_PATH = Path(__file__).with_name("config.yaml")
 DEFAULT_SAVE_ROOT = "~"
 DEFAULT_MAX_TEXT_BYTES = 1_048_576
 REQUEST_BODY_OVERHEAD_BYTES = 65_536
+MAX_PATH_RESULTS = 30
+MAX_PATH_SCAN_ENTRIES = 300
 BIND_HOST = "127.0.0.1"
 LOGGER = logging.getLogger("file_bridge")
 REQUEST_ID = contextvars.ContextVar("request_id", default="-")
@@ -220,6 +223,12 @@ def _validate_path_length(path: Path, save_root: Path) -> None:
 
 
 def _expand_user_path(raw_path: str, save_root: Path) -> Path:
+    try:
+        raw_path.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise HTTPException(
+            status_code=400, detail="Invalid path: must be valid UTF-8"
+        ) from exc
     if "\x00" in raw_path:
         raise HTTPException(status_code=400, detail="Invalid path: contains a NUL byte")
 
@@ -245,6 +254,10 @@ def _is_within(path: Path, root: Path) -> bool:
 def _resolve_save_path(raw_path: str, config: AppConfig) -> Path:
     if not raw_path or raw_path.isspace():
         raise HTTPException(status_code=400, detail="Missing save path")
+    if raw_path.endswith("/"):
+        raise HTTPException(
+            status_code=400, detail="Save path must name a file, not a directory"
+        )
 
     save_root = config.save_root
     clean = _expand_user_path(raw_path, save_root)
@@ -601,9 +614,12 @@ def save_text(request: SaveRequest) -> SaveResponse:
 
 @app.get("/paths", response_model=PathsResponse)
 def list_paths(prefix: str = "") -> PathsResponse:
+    """Return sorted suggestions from at most MAX_PATH_SCAN_ENTRIES entries."""
+
     config = _get_runtime_config()
     save_root = config.save_root
     prefix_ends_with_separator = prefix.endswith("/")
+    exact_directory = False
 
     if prefix:
         search_dir = _expand_user_path(prefix, save_root)
@@ -632,7 +648,7 @@ def list_paths(prefix: str = "") -> PathsResponse:
         return PathsResponse(paths=[])
 
     prefix_lower = ""
-    if prefix and not prefix_ends_with_separator:
+    if prefix and not prefix_ends_with_separator and not exact_directory:
         raw_name = Path(prefix).name.lower()
         if raw_name and raw_name != "~":
             prefix_lower = raw_name
@@ -640,7 +656,15 @@ def list_paths(prefix: str = "") -> PathsResponse:
     paths: list[tuple[str, bool]] = []
     try:
         with os.scandir(resolved_search_dir) as entries:
-            for entry in entries:
+            for entry in islice(entries, MAX_PATH_SCAN_ENTRIES):
+                try:
+                    entry.name.encode("utf-8", errors="strict")
+                except UnicodeEncodeError:
+                    LOGGER.warning(
+                        "skipping path suggestion that is not valid UTF-8",
+                        extra={"event": "path_encoding_invalid"},
+                    )
+                    continue
                 if prefix_lower and not entry.name.lower().startswith(prefix_lower):
                     continue
                 try:
@@ -658,7 +682,7 @@ def list_paths(prefix: str = "") -> PathsResponse:
                     )
                     continue
                 bisect.insort(paths, (entry.name, is_directory))
-                if len(paths) > 30:
+                if len(paths) > MAX_PATH_RESULTS:
                     paths.pop()
     except OSError as exc:
         if exc.errno in INVALID_PATH_ERRNOS:

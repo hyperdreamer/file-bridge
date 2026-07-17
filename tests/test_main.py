@@ -51,6 +51,32 @@ def test_save_rejects_paths_outside_save_root(
     assert not (tmp_path.parent / "outside.txt").exists()
 
 
+def test_save_rejects_non_utf8_path_without_side_effects(
+    client: TestClient, tmp_path: Path
+) -> None:
+    response = client.post(
+        "/save",
+        content='{"text": "no", "path": "invalid-\\udcff.txt"}',
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Invalid path: must be valid UTF-8"}
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_save_rejects_trailing_slash_without_side_effects(
+    client: TestClient, tmp_path: Path
+) -> None:
+    response = client.post("/save", json={"text": "no", "path": "directory/"})
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": "Save path must name a file, not a directory"
+    }
+    assert not (tmp_path / "directory").exists()
+
+
 def test_save_allows_text_within_byte_limit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -202,6 +228,20 @@ def test_paths_lists_directory_contents_when_prefix_ends_with_slash(
     assert response.json() == {"paths": ["notes/archive/", "notes/today.md"]}
 
 
+def test_paths_lists_directory_contents_for_exact_directory_prefix(
+    client: TestClient, tmp_path: Path
+) -> None:
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "today.md").write_text("today", encoding="utf-8")
+    (notes / "archive").mkdir()
+
+    response = client.get("/paths", params={"prefix": "notes"})
+
+    assert response.status_code == 200
+    assert response.json() == {"paths": ["notes/archive/", "notes/today.md"]}
+
+
 def test_paths_returns_at_most_30_results(client: TestClient, tmp_path: Path) -> None:
     for index in reversed(range(35)):
         (tmp_path / f"file-{index:02}.txt").write_text("x", encoding="utf-8")
@@ -210,6 +250,46 @@ def test_paths_returns_at_most_30_results(client: TestClient, tmp_path: Path) ->
 
     assert response.status_code == 200
     assert response.json()["paths"] == [f"file-{index:02}.txt" for index in range(30)]
+
+
+def test_paths_stops_at_scanned_entry_budget(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(main, "MAX_PATH_SCAN_ENTRIES", 2)
+    real_resolve = main.Path.resolve
+    resolved_entries = 0
+
+    def recording_resolve(path: Path, strict: bool = False) -> Path:
+        nonlocal resolved_entries
+        if path.parent == tmp_path:
+            resolved_entries += 1
+        return real_resolve(path, strict=strict)
+
+    monkeypatch.setattr(main.Path, "resolve", recording_resolve)
+    for filename in ["third.txt", "first.txt", "second.txt"]:
+        (tmp_path / filename).write_text("x", encoding="utf-8")
+
+    response = client.get("/paths")
+
+    assert response.status_code == 200
+    assert len(response.json()["paths"]) == 2
+    assert resolved_entries == 2
+
+
+def test_paths_skips_directory_entries_that_are_not_valid_utf8(
+    client: TestClient, tmp_path: Path
+) -> None:
+    invalid_path = bytes(tmp_path) + b"/invalid-\xff.txt"
+    file_descriptor = main.os.open(
+        invalid_path, main.os.O_WRONLY | main.os.O_CREAT, 0o600
+    )
+    main.os.close(file_descriptor)
+    (tmp_path / "valid.txt").write_text("ok", encoding="utf-8")
+
+    response = client.get("/paths")
+
+    assert response.status_code == 200
+    assert response.json() == {"paths": ["valid.txt"]}
 
 
 def test_paths_treats_backslash_as_a_posix_filename_character(

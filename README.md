@@ -50,7 +50,10 @@ filesystem does not support a requested durability sync.
 - `GET /ready` verifies that the configured save root remains accessible and
   returns `503` when the service is not ready.
 - `POST /save` accepts `{ "text": "...", "path": "notes/file.txt" }`.
-- `GET /paths?prefix=notes/` returns up to 30 matching paths.
+- `GET /paths?prefix=notes/` returns up to 30 matching paths. To keep completion
+  latency bounded, each request inspects at most 300 directory entries; results
+  are the sorted first 30 matches found within that scan and may therefore be
+  truncated in very large directories.
 
 `/paths` never follows suggestions outside `save_root` or into the file-bridge
 application directory. Request bodies reject unknown fields. Empty and

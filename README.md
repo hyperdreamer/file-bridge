@@ -3,6 +3,11 @@
 A small localhost-only FastAPI service that saves text to disk and provides
 filesystem path suggestions for TextKit.
 
+## Requirements
+
+- Python 3.12+ on a POSIX system
+- Bash (for `start.sh`)
+
 ## Setup
 
 ```bash

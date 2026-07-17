@@ -476,9 +476,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         )
         raise RuntimeError(f"Startup validation failed: {exc}") from exc
 
-    _cleanup_stale_temp_files(config.save_root)
     RUNTIME_CONFIG = config
     READY = True
+    _cleanup_stale_temp_files(config.save_root)
     LOGGER.info(
         "file-bridge is ready",
         extra={
@@ -577,6 +577,18 @@ class RequestMiddleware:
                 return {"type": "http.request", "body": b"", "more_body": False}
 
             await self.app(scope, replay_receive, send_with_request_id)
+            status_code = 200
+        except Exception:
+            LOGGER.exception(
+                "unhandled error in request handler",
+                extra={"event": "request_error"},
+            )
+            status_code = 500
+            response = JSONResponse(
+                status_code=500,
+                content={"detail": "Internal Server Error"},
+            )
+            await response(scope, receive, send_with_request_id)
         finally:
             duration_ms = round((time.monotonic() - started) * 1000, 3)
             LOGGER.info(

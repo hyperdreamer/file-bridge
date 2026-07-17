@@ -23,7 +23,8 @@ from pathlib import Path
 from typing import Any, cast
 
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -397,7 +398,7 @@ def _atomic_write_text(path: Path, text: str) -> str | None:
 
 
 def _is_internal_temp_name(name: str) -> bool:
-    return name.startswith(".file-bridge-") and name.endswith(".tmp")
+    return TEMP_FILE_PATTERN.fullmatch(name) is not None
 
 
 def _cleanup_stale_temp_files(save_root: Path) -> None:
@@ -619,8 +620,19 @@ class RequestMiddleware:
             REQUEST_ID.reset(token)
 
 
-app = FastAPI(title="File Bridge", version="0.0.2", lifespan=lifespan)
+app = FastAPI(title="File Bridge", version="0.0.3", lifespan=lifespan)
 app.add_middleware(RequestMiddleware)
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_exception_handler(
+    _request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    errors = [
+        {key: value for key, value in error.items() if key != "input"}
+        for error in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": errors})
 
 
 @app.get("/health", response_model=HealthResponse)

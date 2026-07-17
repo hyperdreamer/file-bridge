@@ -306,6 +306,17 @@ def test_paths_excludes_internal_temporary_files(client: TestClient, tmp_path: P
     assert response.json() == {"paths": ["visible.txt"]}
 
 
+def test_save_custom_temp_filename_appears_in_paths(client: TestClient) -> None:
+    filename = ".file-bridge-custom.tmp"
+
+    save_response = client.post("/save", json={"text": "visible", "path": filename})
+    paths_response = client.get("/paths")
+
+    assert save_response.status_code == 200
+    assert paths_response.status_code == 200
+    assert paths_response.json() == {"paths": [filename]}
+
+
 def test_paths_treats_backslash_as_a_posix_filename_character(
     client: TestClient, tmp_path: Path
 ) -> None:
@@ -562,6 +573,45 @@ def test_save_rejects_extra_request_fields(client: TestClient) -> None:
     response = client.post("/save", json={"text": "hello", "path": "ok.txt", "unexpected": True})
 
     assert response.status_code == 422
+
+
+def test_save_rejects_extra_field_with_unpaired_surrogate(
+    client: TestClient, tmp_path: Path
+) -> None:
+    response = client.post(
+        "/save",
+        content=b'{"text":"hello","path":"ok.txt","unexpected":"\\ud800"}',
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_save_rejects_wrong_type_field_with_unpaired_surrogate(
+    client: TestClient, tmp_path: Path
+) -> None:
+    response = client.post(
+        "/save",
+        content=b'{"text":["\\ud800"],"path":"ok.txt"}',
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_save_rejects_root_body_with_unpaired_surrogate(
+    client: TestClient, tmp_path: Path
+) -> None:
+    response = client.post(
+        "/save",
+        content=b'"\\ud800"',
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 422
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_paths_excludes_symlinks_that_escape_save_root(

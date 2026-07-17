@@ -33,10 +33,12 @@ APPLICATION_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = Path(__file__).with_name("config.yaml")
 DEFAULT_SAVE_ROOT = "~"
 DEFAULT_MAX_TEXT_BYTES = 1_048_576
+MAX_MAX_TEXT_BYTES = 100 * 1_048_576
 REQUEST_BODY_OVERHEAD_BYTES = 65_536
 MAX_PATH_RESULTS = 30
 MAX_PATH_SCAN_ENTRIES = 300
 STALE_TEMP_FILE_AGE_SECONDS = 24 * 60 * 60
+MAX_CLEANUP_SCAN_ENTRIES = 10_000
 BIND_HOST = "127.0.0.1"
 LOGGER = logging.getLogger("file_bridge")
 REQUEST_ID = contextvars.ContextVar("request_id", default="-")
@@ -129,7 +131,7 @@ def _load_yaml_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
             loaded = yaml.load(config_file, Loader=UniqueKeyLoader)
     except FileNotFoundError as exc:
         raise RuntimeError(f"Configuration file not found: {path}") from exc
-    except (yaml.YAMLError, UnicodeError) as exc:
+    except (yaml.YAMLError, UnicodeError, ValueError) as exc:
         raise RuntimeError(f"Invalid YAML in {path}: {exc}") from exc
     except OSError as exc:
         raise RuntimeError(f"Cannot read config file {path}: {exc}") from exc
@@ -176,6 +178,8 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     max_text_bytes = raw_config.get("max_text_bytes", DEFAULT_MAX_TEXT_BYTES)
     if type(max_text_bytes) is not int or max_text_bytes < 0:
         raise RuntimeError("config max_text_bytes must be a non-negative integer")
+    if max_text_bytes > MAX_MAX_TEXT_BYTES:
+        raise RuntimeError(f"config max_text_bytes must not exceed {MAX_MAX_TEXT_BYTES}")
 
     return AppConfig(
         save_root=save_root_path,
@@ -252,6 +256,9 @@ def _resolve_save_path(raw_path: str, config: AppConfig) -> Path:
         raise HTTPException(status_code=400, detail="Missing save path")
     if raw_path.endswith("/"):
         raise HTTPException(status_code=400, detail="Save path must name a file, not a directory")
+    filename = Path(raw_path.rstrip("/")).name
+    if TEMP_FILE_PATTERN.fullmatch(filename):
+        raise HTTPException(status_code=400, detail="Save path uses a reserved filename pattern")
 
     save_root = config.save_root
     clean = _expand_user_path(raw_path, save_root)
@@ -406,9 +413,17 @@ def _cleanup_stale_temp_files(save_root: Path) -> None:
             extra={"event": "temp_cleanup_scan_failed"},
         )
 
+    scanned = 0
     for directory, directory_names, filenames in os.walk(
         save_root, followlinks=False, onerror=log_walk_error
     ):
+        if scanned >= MAX_CLEANUP_SCAN_ENTRIES:
+            LOGGER.warning(
+                "stale temp cleanup reached scan limit",
+                extra={"event": "temp_cleanup_scan_limit"},
+            )
+            break
+        scanned += 1
         directory_path = Path(directory)
         if _is_within(directory_path, APPLICATION_ROOT):
             directory_names.clear()
@@ -577,7 +592,6 @@ class RequestMiddleware:
                 return {"type": "http.request", "body": b"", "more_body": False}
 
             await self.app(scope, replay_receive, send_with_request_id)
-            status_code = 200
         except Exception:
             LOGGER.exception(
                 "unhandled error in request handler",

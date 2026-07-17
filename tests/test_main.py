@@ -886,3 +886,10 @@ def test_json_log_formatter_includes_structured_request_context() -> None:
     assert payload["event"] == "request_complete"
     assert payload["request_id"] == "request-42"
     assert payload["status_code"] == 200
+
+
+def test_save_rejects_reserved_temp_filename(client: TestClient) -> None:
+    response = client.post("/save", json={"text": "no", "path": ".file-bridge-abcdefgh.tmp"})
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Save path uses a reserved filename pattern"}

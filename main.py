@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import islice
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
 from fastapi import FastAPI, HTTPException
@@ -98,9 +98,7 @@ class AppConfig:
 class UniqueKeyLoader(yaml.SafeLoader):
     """Safe YAML loader that refuses ambiguous duplicate mapping keys."""
 
-    def construct_mapping(
-        self, node: yaml.MappingNode, deep: bool = False
-    ) -> dict[Any, Any]:
+    def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
         self.flatten_mapping(node)
         mapping: dict[Any, Any] = {}
         for key_node, value_node in node.value:
@@ -219,18 +217,14 @@ def _validate_path_length(path: Path, save_root: Path) -> None:
     if path_max != -1 and len(encoded_path) >= path_max:
         raise HTTPException(status_code=400, detail="Invalid path: path is too long")
     if name_max != -1 and any(len(part) > name_max for part in encoded_parts):
-        raise HTTPException(
-            status_code=400, detail="Invalid path: a path component is too long"
-        )
+        raise HTTPException(status_code=400, detail="Invalid path: a path component is too long")
 
 
 def _expand_user_path(raw_path: str, save_root: Path) -> Path:
     try:
         raw_path.encode("utf-8", errors="strict")
     except UnicodeEncodeError as exc:
-        raise HTTPException(
-            status_code=400, detail="Invalid path: must be valid UTF-8"
-        ) from exc
+        raise HTTPException(status_code=400, detail="Invalid path: must be valid UTF-8") from exc
     if "\x00" in raw_path:
         raise HTTPException(status_code=400, detail="Invalid path: contains a NUL byte")
 
@@ -257,9 +251,7 @@ def _resolve_save_path(raw_path: str, config: AppConfig) -> Path:
     if not raw_path or raw_path.isspace():
         raise HTTPException(status_code=400, detail="Missing save path")
     if raw_path.endswith("/"):
-        raise HTTPException(
-            status_code=400, detail="Save path must name a file, not a directory"
-        )
+        raise HTTPException(status_code=400, detail="Save path must name a file, not a directory")
 
     save_root = config.save_root
     clean = _expand_user_path(raw_path, save_root)
@@ -329,9 +321,7 @@ def _ensure_parent_directories(path: Path) -> list[str]:
             current = current.parent
         else:
             if not current.is_dir():
-                raise NotADirectoryError(
-                    errno.ENOTDIR, "A parent component is not a directory"
-                )
+                raise NotADirectoryError(errno.ENOTDIR, "A parent component is not a directory")
             break
 
     warnings: list[str] = []
@@ -502,7 +492,8 @@ def _request_body_limit(config: AppConfig) -> int:
 
 
 def _header_value(scope: Scope, name: bytes) -> str | None:
-    for header_name, value in scope.get("headers", []):
+    headers = cast(list[tuple[bytes, bytes]], scope.get("headers", []))
+    for header_name, value in headers:
         if header_name.lower() == name:
             return value.decode("latin-1")
     return None
@@ -627,9 +618,7 @@ def save_text(request: SaveRequest) -> SaveResponse:
     try:
         text_bytes = len(request.text.encode("utf-8"))
     except UnicodeEncodeError as exc:
-        raise HTTPException(
-            status_code=400, detail="Text cannot be encoded as UTF-8"
-        ) from exc
+        raise HTTPException(status_code=400, detail="Text cannot be encoded as UTF-8") from exc
     if config.max_text_bytes > 0:
         if text_bytes > config.max_text_bytes:
             raise HTTPException(

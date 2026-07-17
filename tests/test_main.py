@@ -7,16 +7,18 @@ import logging
 import os
 import stat
 import time
+from collections.abc import Generator
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import main
 
 
 @pytest.fixture
-def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
     config = main.AppConfig(save_root=tmp_path)
     monkeypatch.setattr(main, "RUNTIME_CONFIG", config)
     with TestClient(main.app) as test_client:
@@ -32,9 +34,7 @@ def test_save_creates_file_and_returns_path(client: TestClient, tmp_path: Path) 
     assert expected.read_text(encoding="utf-8") == "hello"
 
 
-def test_save_accepts_absolute_paths_inside_save_root(
-    client: TestClient, tmp_path: Path
-) -> None:
+def test_save_accepts_absolute_paths_inside_save_root(client: TestClient, tmp_path: Path) -> None:
     target = tmp_path / "absolute.txt"
 
     response = client.post("/save", json={"text": "absolute", "path": str(target)})
@@ -44,9 +44,7 @@ def test_save_accepts_absolute_paths_inside_save_root(
     assert target.read_text(encoding="utf-8") == "absolute"
 
 
-def test_save_rejects_paths_outside_save_root(
-    client: TestClient, tmp_path: Path
-) -> None:
+def test_save_rejects_paths_outside_save_root(client: TestClient, tmp_path: Path) -> None:
     response = client.post("/save", json={"text": "no", "path": "../outside.txt"})
 
     assert response.status_code == 400
@@ -73,9 +71,7 @@ def test_save_rejects_trailing_slash_without_side_effects(
     response = client.post("/save", json={"text": "no", "path": "directory/"})
 
     assert response.status_code == 400
-    assert response.json() == {
-        "detail": "Save path must name a file, not a directory"
-    }
+    assert response.json() == {"detail": "Save path must name a file, not a directory"}
     assert not (tmp_path / "directory").exists()
 
 
@@ -129,10 +125,8 @@ def test_save_atomic_failure_does_not_corrupt_existing_file(
     def fail_replace(_source: Path, _destination: Path) -> None:
         raise OSError(errno.EIO, "simulated rename failure")
 
-    monkeypatch.setattr(main.os, "replace", fail_replace)
-    response = client.post(
-        "/save", json={"text": "replacement", "path": "existing.txt"}
-    )
+    monkeypatch.setattr(os, "replace", fail_replace)
+    response = client.post("/save", json={"text": "replacement", "path": "existing.txt"})
 
     assert response.status_code == 500
     assert target.read_text(encoding="utf-8") == "original"
@@ -153,10 +147,8 @@ def test_save_maps_storage_einval_to_500(
     assert response.json() == {"detail": "Failed to save text"}
 
 
-def test_save_encoding_failure_removes_temp_file(
-    client: TestClient, tmp_path: Path
-) -> None:
-    # Use raw content to bypass httpx JSON serialization which rejects
+def test_save_encoding_failure_removes_temp_file(client: TestClient, tmp_path: Path) -> None:
+    # Use raw content to bypass httpx2 JSON serialization, which rejects
     # unpaired surrogates before the request reaches the server.
     response = client.post(
         "/save",
@@ -169,16 +161,12 @@ def test_save_encoding_failure_removes_temp_file(
     assert list(tmp_path.glob(".file-bridge-*.tmp")) == []
 
 
-def test_save_overwrite_preserves_existing_permissions(
-    client: TestClient, tmp_path: Path
-) -> None:
+def test_save_overwrite_preserves_existing_permissions(client: TestClient, tmp_path: Path) -> None:
     target = tmp_path / "existing.txt"
     target.write_text("original", encoding="utf-8")
     target.chmod(0o644)
 
-    response = client.post(
-        "/save", json={"text": "replacement", "path": "existing.txt"}
-    )
+    response = client.post("/save", json={"text": "replacement", "path": "existing.txt"})
 
     assert response.status_code == 200
     assert stat.S_IMODE(target.stat().st_mode) == 0o644
@@ -187,7 +175,7 @@ def test_save_overwrite_preserves_existing_permissions(
 def test_save_returns_success_when_directory_fsync_fails(
     client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    real_fsync = main.os.fsync
+    real_fsync = os.fsync
     calls = 0
 
     def fail_second_fsync(file_descriptor: int) -> None:
@@ -197,7 +185,7 @@ def test_save_returns_success_when_directory_fsync_fails(
             raise OSError("sync failed")
         real_fsync(file_descriptor)
 
-    monkeypatch.setattr(main.os, "fsync", fail_second_fsync)
+    monkeypatch.setattr(os, "fsync", fail_second_fsync)
 
     response = client.post("/save", json={"text": "saved", "path": "durable.txt"})
 
@@ -272,7 +260,7 @@ def test_paths_stops_at_scanned_entry_budget(
     client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(main, "MAX_PATH_SCAN_ENTRIES", 2)
-    real_resolve = main.Path.resolve
+    real_resolve = Path.resolve
     resolved_entries = 0
 
     def recording_resolve(path: Path, strict: bool = False) -> Path:
@@ -281,7 +269,7 @@ def test_paths_stops_at_scanned_entry_budget(
             resolved_entries += 1
         return real_resolve(path, strict=strict)
 
-    monkeypatch.setattr(main.Path, "resolve", recording_resolve)
+    monkeypatch.setattr(Path, "resolve", recording_resolve)
     for filename in ["third.txt", "first.txt", "second.txt"]:
         (tmp_path / filename).write_text("x", encoding="utf-8")
 
@@ -296,10 +284,8 @@ def test_paths_skips_directory_entries_that_are_not_valid_utf8(
     client: TestClient, tmp_path: Path
 ) -> None:
     invalid_path = bytes(tmp_path) + b"/invalid-\xff.txt"
-    file_descriptor = main.os.open(
-        invalid_path, main.os.O_WRONLY | main.os.O_CREAT, 0o600
-    )
-    main.os.close(file_descriptor)
+    file_descriptor = os.open(invalid_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    os.close(file_descriptor)
     (tmp_path / "valid.txt").write_text("ok", encoding="utf-8")
 
     response = client.get("/paths")
@@ -308,9 +294,7 @@ def test_paths_skips_directory_entries_that_are_not_valid_utf8(
     assert response.json() == {"paths": ["valid.txt"]}
 
 
-def test_paths_excludes_internal_temporary_files(
-    client: TestClient, tmp_path: Path
-) -> None:
+def test_paths_excludes_internal_temporary_files(client: TestClient, tmp_path: Path) -> None:
     (tmp_path / ".file-bridge-abcdefgh.tmp").write_text("partial", encoding="utf-8")
     (tmp_path / "visible.txt").write_text("ok", encoding="utf-8")
 
@@ -392,9 +376,7 @@ def test_overwriting_config_file_does_not_change_active_save_root(
 
     config_path.write_text(f'save_root: "{changed_root}"\n', encoding="utf-8")
     with TestClient(main.app) as client:
-        response = client.post(
-            "/save", json={"text": "still active", "path": "runtime.txt"}
-        )
+        response = client.post("/save", json={"text": "still active", "path": "runtime.txt"})
 
     assert response.status_code == 200
     assert (active_root / "runtime.txt").read_text(encoding="utf-8") == "still active"
@@ -428,9 +410,7 @@ def test_config_defaults_port(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("yaml_value", ["null", "123", "false"])
-def test_config_rejects_null_or_non_string_save_root(
-    tmp_path: Path, yaml_value: str
-) -> None:
+def test_config_rejects_null_or_non_string_save_root(tmp_path: Path, yaml_value: str) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(f"save_root: {yaml_value}\n", encoding="utf-8")
 
@@ -492,9 +472,7 @@ def test_config_rejects_negative_max_text_bytes(tmp_path: Path) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text("max_text_bytes: -1\n", encoding="utf-8")
 
-    with pytest.raises(
-        RuntimeError, match="max_text_bytes must be a non-negative integer"
-    ):
+    with pytest.raises(RuntimeError, match="max_text_bytes must be a non-negative integer"):
         main.load_config(path=config_path)
 
 
@@ -535,7 +513,7 @@ def test_resolve_save_path_rejects_application_files(filename: str) -> None:
     config = main.AppConfig(save_root=main.APPLICATION_ROOT.parent)
 
     with pytest.raises(
-        main.HTTPException,
+        HTTPException,
         match="Cannot save inside the file-bridge application directory",
     ) as exc_info:
         main._resolve_save_path(str(main.APPLICATION_ROOT / filename), config)
@@ -551,7 +529,7 @@ def test_resolve_save_path_rejects_symlink_into_application_directory(
     config = main.AppConfig(save_root=tmp_path)
 
     with pytest.raises(
-        main.HTTPException,
+        HTTPException,
         match="Cannot save inside the file-bridge application directory",
     ) as exc_info:
         main._resolve_save_path(str(application_link / "main.py"), config)
@@ -559,9 +537,7 @@ def test_resolve_save_path_rejects_symlink_into_application_directory(
     assert exc_info.value.status_code == 400
 
 
-@pytest.mark.parametrize(
-    "path", ["bad\x00name.txt", "~definitely-no-such-user/file.txt"]
-)
+@pytest.mark.parametrize("path", ["bad\x00name.txt", "~definitely-no-such-user/file.txt"])
 def test_save_rejects_invalid_user_paths(client: TestClient, path: str) -> None:
     response = client.post("/save", json={"text": "no", "path": path})
 
@@ -581,9 +557,7 @@ def test_paths_rejects_invalid_user_paths(client: TestClient) -> None:
 
 
 def test_save_rejects_extra_request_fields(client: TestClient) -> None:
-    response = client.post(
-        "/save", json={"text": "hello", "path": "ok.txt", "unexpected": True}
-    )
+    response = client.post("/save", json={"text": "hello", "path": "ok.txt", "unexpected": True})
 
     assert response.status_code == 422
 
@@ -661,9 +635,7 @@ def test_missing_config_file_is_rejected(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("save_root", ["''", '""', "'   '", '"\t"'])
-def test_config_rejects_empty_or_whitespace_save_root(
-    tmp_path: Path, save_root: str
-) -> None:
+def test_config_rejects_empty_or_whitespace_save_root(tmp_path: Path, save_root: str) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(f"save_root: {save_root}\n", encoding="utf-8")
 
@@ -673,9 +645,7 @@ def test_config_rejects_empty_or_whitespace_save_root(
 
 def test_config_rejects_duplicate_top_level_keys(tmp_path: Path) -> None:
     config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        f'save_root: "{tmp_path}"\nsave_root: "/tmp"\n', encoding="utf-8"
-    )
+    config_path.write_text(f'save_root: "{tmp_path}"\nsave_root: "/tmp"\n', encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="duplicate key 'save_root'"):
         main.load_config(config_path)
@@ -707,9 +677,7 @@ def test_startup_rejects_save_root_that_is_not_a_directory(
 def test_startup_rejects_save_root_inside_application_directory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        main, "RUNTIME_CONFIG", main.AppConfig(save_root=main.APPLICATION_ROOT)
-    )
+    monkeypatch.setattr(main, "RUNTIME_CONFIG", main.AppConfig(save_root=main.APPLICATION_ROOT))
 
     with pytest.raises(RuntimeError, match="inside the application directory"):
         with TestClient(main.app):
@@ -741,7 +709,7 @@ def test_stale_temp_cleanup_preserves_files_owned_by_another_user(
     stale.write_text("stale", encoding="utf-8")
     old_timestamp = time.time() - main.STALE_TEMP_FILE_AGE_SECONDS - 1
     os.utime(stale, (old_timestamp, old_timestamp))
-    monkeypatch.setattr(main.os, "getuid", lambda: stale.stat().st_uid + 1)
+    monkeypatch.setattr(os, "getuid", lambda: stale.stat().st_uid + 1)
 
     main._cleanup_stale_temp_files(tmp_path)
 
@@ -765,10 +733,8 @@ def test_startup_rejects_inaccessible_save_root(
             pass
 
 
-def test_save_supports_maximum_length_filename(
-    client: TestClient, tmp_path: Path
-) -> None:
-    name_max = main.os.pathconf(tmp_path, "PC_NAME_MAX")
+def test_save_supports_maximum_length_filename(client: TestClient, tmp_path: Path) -> None:
+    name_max = os.pathconf(tmp_path, "PC_NAME_MAX")
     if name_max == -1:
         pytest.skip("filesystem does not report NAME_MAX")
     filename = "n" * name_max
@@ -786,8 +752,8 @@ def test_overwrite_fsyncs_after_permission_change(
     target = tmp_path / "existing.txt"
     target.write_text("old", encoding="utf-8")
     events: list[str] = []
-    real_fsync = main.os.fsync
-    real_fchmod = main.os.fchmod
+    real_fsync = os.fsync
+    real_fchmod = os.fchmod
 
     def recording_fsync(file_descriptor: int) -> None:
         events.append("fsync")
@@ -797,8 +763,8 @@ def test_overwrite_fsyncs_after_permission_change(
         events.append("fchmod")
         real_fchmod(file_descriptor, mode)
 
-    monkeypatch.setattr(main.os, "fsync", recording_fsync)
-    monkeypatch.setattr(main.os, "fchmod", recording_fchmod)
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+    monkeypatch.setattr(os, "fchmod", recording_fchmod)
 
     main._atomic_write_text(target, "new")
 
@@ -824,35 +790,23 @@ def test_new_parent_directories_are_fsynced(
     assert synced == [tmp_path, tmp_path / "one", tmp_path / "one" / "two"]
 
 
-def test_save_maps_existing_directory_conflict_to_400(
-    client: TestClient, tmp_path: Path
-) -> None:
+def test_save_maps_existing_directory_conflict_to_400(client: TestClient, tmp_path: Path) -> None:
     (tmp_path / "destination").mkdir()
 
-    response = client.post(
-        "/save", json={"text": "no", "path": "destination"}
-    )
+    response = client.post("/save", json={"text": "no", "path": "destination"})
 
     assert response.status_code == 400
-    assert response.json() == {
-        "detail": "Destination conflicts with an existing filesystem entry"
-    }
+    assert response.json() == {"detail": "Destination conflicts with an existing filesystem entry"}
     assert str(tmp_path) not in response.text
 
 
-def test_save_maps_non_directory_parent_conflict_to_400(
-    client: TestClient, tmp_path: Path
-) -> None:
+def test_save_maps_non_directory_parent_conflict_to_400(client: TestClient, tmp_path: Path) -> None:
     (tmp_path / "parent").write_text("file", encoding="utf-8")
 
-    response = client.post(
-        "/save", json={"text": "no", "path": "parent/child.txt"}
-    )
+    response = client.post("/save", json={"text": "no", "path": "parent/child.txt"})
 
     assert response.status_code == 400
-    assert response.json() == {
-        "detail": "Destination conflicts with an existing filesystem entry"
-    }
+    assert response.json() == {"detail": "Destination conflicts with an existing filesystem entry"}
     assert str(tmp_path) not in response.text
 
 
@@ -863,9 +817,7 @@ def test_save_rejects_whitespace_only_path(client: TestClient) -> None:
     assert response.json() == {"detail": "Missing save path"}
 
 
-def test_save_preserves_nonempty_path_whitespace(
-    client: TestClient, tmp_path: Path
-) -> None:
+def test_save_preserves_nonempty_path_whitespace(client: TestClient, tmp_path: Path) -> None:
     filename = " spaced name.txt "
 
     response = client.post("/save", json={"text": "exact", "path": filename})

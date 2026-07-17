@@ -5,7 +5,7 @@ cd -- "$(dirname -- "$0")"
 
 if [[ ! -x .venv/bin/python ]]; then
     echo "ERROR: .venv/bin/python is missing or not executable." >&2
-    echo "Create the environment and install requirements-dev.txt first." >&2
+    echo "Create the environment and install requirements.txt first." >&2
     exit 1
 fi
 

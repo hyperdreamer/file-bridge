@@ -37,10 +37,8 @@ save root first, then prints actionable diagnostics if startup cannot proceed.
 The default `max_text_bytes` is 1 MiB. It limits the UTF-8 encoded text after
 JSON decoding. The server also rejects an oversized raw request body before
 JSON parsing; its allowance includes bounded space for JSON escaping and the
-request envelope. Setting `max_text_bytes` to `0` disables only the decoded-text
-check. The raw-body cap still uses the default 1 MiB decoded-text allowance in
-its calculation: six times that allowance for JSON escaping plus 64 KiB of
-envelope overhead, or about 6.1 MiB of raw HTTP body bytes.
+request envelope. Setting `max_text_bytes` to `0` disables all text size limits,
+including the raw-body cap.
 
 Atomic overwrites preserve existing Unix mode bits. New parent directories,
 file data, permission changes, and the final directory entry are synced for

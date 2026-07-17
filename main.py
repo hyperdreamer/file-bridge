@@ -509,9 +509,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         LOGGER.info("file-bridge stopped", extra={"event": "shutdown_complete"})
 
 
-def _request_body_limit(config: AppConfig) -> int:
-    text_limit = config.max_text_bytes or DEFAULT_MAX_TEXT_BYTES
-    return text_limit * 6 + REQUEST_BODY_OVERHEAD_BYTES
+def _request_body_limit(config: AppConfig) -> int | None:
+    if config.max_text_bytes == 0:
+        return None
+    return config.max_text_bytes * 6 + REQUEST_BODY_OVERHEAD_BYTES
 
 
 def _header_value(scope: Scope, name: bytes) -> str | None:
@@ -558,7 +559,7 @@ class RequestMiddleware:
                     declared_length = int(content_length)
                 except ValueError:
                     declared_length = 0
-                if declared_length > max_body_bytes:
+                if max_body_bytes is not None and declared_length > max_body_bytes:
                     status_code = 413
                     response = JSONResponse(
                         status_code=413,
@@ -575,7 +576,7 @@ class RequestMiddleware:
                 if message["type"] != "http.request":
                     break
                 received_bytes += len(message.get("body", b""))
-                if received_bytes > max_body_bytes:
+                if max_body_bytes is not None and received_bytes > max_body_bytes:
                     status_code = 413
                     response = JSONResponse(
                         status_code=413,
@@ -618,7 +619,7 @@ class RequestMiddleware:
             REQUEST_ID.reset(token)
 
 
-app = FastAPI(title="File Bridge", lifespan=lifespan)
+app = FastAPI(title="File Bridge", version="0.0.2", lifespan=lifespan)
 app.add_middleware(RequestMiddleware)
 
 

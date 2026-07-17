@@ -3,7 +3,7 @@
 save_root: "~"
 
 # Maximum UTF-8 encoded text size in bytes. The default is 1 MiB. Set to 0 to
-# disable the decoded-text check; the server-level request body cap still applies.
+# disable the decoded-text check.
 max_text_bytes: 1048576
 
 # Server port (always binds to 127.0.0.1 only).

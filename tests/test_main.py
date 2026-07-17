@@ -108,7 +108,8 @@ def test_save_with_zero_limit_allows_large_text(
 ) -> None:
     config = main.AppConfig(save_root=tmp_path, max_text_bytes=0)
     monkeypatch.setattr(main, "RUNTIME_CONFIG", config)
-    text = "x" * 100_000
+    legacy_body_limit = main.DEFAULT_MAX_TEXT_BYTES * 6 + main.REQUEST_BODY_OVERHEAD_BYTES
+    text = "x" * (legacy_body_limit + 1)
 
     with TestClient(main.app) as client:
         response = client.post("/save", json={"text": text, "path": "large.txt"})

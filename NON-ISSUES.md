@@ -10,18 +10,23 @@ developer use on a trusted single-user machine**. Local code execution is
 assumed to be under the user's control — if an attacker has local code
 execution, filesystem-level defenses are moot.
 
-## #1 — Symlinks Bypass Containment
+## #1 — Save Symlinks Bypass Resolved-Root Containment
 
 **What:** `_resolve_save_path()` checks path containment lexically (via
 `os.path.normpath`) before calling `path.resolve()`. A symlink beneath
-`save_root` that points outside could redirect writes or listing outside the
+`save_root` that points outside can therefore redirect a write outside the
 configured root.
 
 **Why it's not an issue:** Exploiting this requires local filesystem control
 (creating symlinks). On a trusted single-user machine, the user can already
 create or modify those files directly. The code intentionally preserves symlink
 usability — e.g., `~/Ramdisk` → `/ramdisk` — which is a deliberate design
-choice documented in the source comments.
+choice documented here.
+
+This exception applies only to explicitly requested save destinations. The
+`/paths` suggestion endpoint checks resolved containment for both search
+directories and returned entries, and does not expose symlinks outside
+`save_root` or into the application directory.
 
 **When it would matter:** If `save_root` contains untrusted content, or the
 service is deployed on a shared multi-user host, or strict "writes never leave

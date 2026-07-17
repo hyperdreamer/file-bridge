@@ -1,0 +1,11 @@
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[[tool.mypy.overrides]]
+module = ["fastapi.*", "pydantic.*", "starlette.*", "uvicorn.*", "yaml.*"]
+ignore_missing_imports = true

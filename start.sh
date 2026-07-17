@@ -25,4 +25,12 @@ if ! .venv/bin/python main.py --check-config; then
     exit 1
 fi
 
+port="$(.venv/bin/python -c 'from main import load_config; print(load_config().port)')"
+port_hex="$(printf '%04X' "$port")"
+if awk -v port="$port_hex" '$2 ~ ":" port "$" && $4 == "0A" { found = 1 } END { exit !found }' \
+    /proc/net/tcp /proc/net/tcp6; then
+    echo "ERROR: port ${port} is already in use" >&2
+    exit 1
+fi
+
 exec .venv/bin/python main.py

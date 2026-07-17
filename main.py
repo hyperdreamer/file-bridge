@@ -36,6 +36,7 @@ DEFAULT_MAX_TEXT_BYTES = 1_048_576
 REQUEST_BODY_OVERHEAD_BYTES = 65_536
 MAX_PATH_RESULTS = 30
 MAX_PATH_SCAN_ENTRIES = 300
+STALE_TEMP_FILE_AGE_SECONDS = 24 * 60 * 60
 BIND_HOST = "127.0.0.1"
 LOGGER = logging.getLogger("file_bridge")
 REQUEST_ID = contextvars.ContextVar("request_id", default="-")
@@ -48,6 +49,7 @@ DESTINATION_CONFLICT_ERRNOS = {
     errno.ENOTDIR,
     errno.ENOTEMPTY,
 }
+TEMP_FILE_PATTERN = re.compile(r"\.file-bridge-[a-z0-9_]{8}\.tmp\Z")
 
 
 class APIModel(BaseModel):
@@ -389,7 +391,56 @@ def _atomic_write_text(path: Path, text: str) -> str | None:
                 )
 
 
+def _is_internal_temp_name(name: str) -> bool:
+    return name.startswith(".file-bridge-") and name.endswith(".tmp")
+
+
+def _cleanup_stale_temp_files(save_root: Path) -> None:
+    """Remove old bridge temp files owned by the current user without following links."""
+
+    cutoff = time.time() - STALE_TEMP_FILE_AGE_SECONDS
+    owner_id = os.getuid()
+
+    def log_walk_error(exc: OSError) -> None:
+        LOGGER.warning(
+            "cannot inspect directory for stale temporary files",
+            exc_info=(type(exc), exc, exc.__traceback__),
+            extra={"event": "temp_cleanup_scan_failed"},
+        )
+
+    for directory, directory_names, filenames in os.walk(
+        save_root, followlinks=False, onerror=log_walk_error
+    ):
+        directory_path = Path(directory)
+        if _is_within(directory_path, APPLICATION_ROOT):
+            directory_names.clear()
+            continue
+
+        for filename in filenames:
+            if TEMP_FILE_PATTERN.fullmatch(filename) is None:
+                continue
+            temp_path = directory_path / filename
+            try:
+                temp_stat = temp_path.stat(follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(temp_stat.st_mode)
+                    or temp_stat.st_uid != owner_id
+                    or temp_stat.st_mtime > cutoff
+                ):
+                    continue
+                temp_path.unlink()
+            except OSError:
+                LOGGER.warning(
+                    "failed to remove stale temporary save file",
+                    exc_info=True,
+                    extra={"event": "temp_cleanup_failed"},
+                )
+
+
 def _probe_save_root(save_root: Path) -> None:
+    if _is_within(save_root, APPLICATION_ROOT):
+        raise RuntimeError("save_root must not be inside the application directory")
+
     try:
         root_stat = save_root.stat()
     except FileNotFoundError as exc:
@@ -427,6 +478,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         )
         raise RuntimeError(f"Startup validation failed: {exc}") from exc
 
+    _cleanup_stale_temp_files(config.save_root)
     RUNTIME_CONFIG = config
     READY = True
     LOGGER.info(
@@ -572,13 +624,13 @@ def readiness() -> HealthResponse:
 def save_text(request: SaveRequest) -> SaveResponse:
     config = _get_runtime_config()
 
+    try:
+        text_bytes = len(request.text.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise HTTPException(
+            status_code=400, detail="Text cannot be encoded as UTF-8"
+        ) from exc
     if config.max_text_bytes > 0:
-        try:
-            text_bytes = len(request.text.encode("utf-8"))
-        except UnicodeEncodeError as exc:
-            raise HTTPException(
-                status_code=400, detail="Text cannot be encoded as UTF-8"
-            ) from exc
         if text_bytes > config.max_text_bytes:
             raise HTTPException(
                 status_code=413,
@@ -592,13 +644,7 @@ def save_text(request: SaveRequest) -> SaveResponse:
 
     try:
         warning = _atomic_write_text(path, request.text)
-    except UnicodeEncodeError as exc:
-        raise HTTPException(
-            status_code=400, detail="Text cannot be encoded as UTF-8"
-        ) from exc
     except OSError as exc:
-        if exc.errno in INVALID_PATH_ERRNOS:
-            raise _invalid_path(exc) from exc
         if exc.errno in DESTINATION_CONFLICT_ERRNOS:
             raise HTTPException(
                 status_code=400,
@@ -657,6 +703,8 @@ def list_paths(prefix: str = "") -> PathsResponse:
     try:
         with os.scandir(resolved_search_dir) as entries:
             for entry in islice(entries, MAX_PATH_SCAN_ENTRIES):
+                if _is_internal_temp_name(entry.name):
+                    continue
                 try:
                     entry.name.encode("utf-8", errors="strict")
                 except UnicodeEncodeError:

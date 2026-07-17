@@ -4,7 +4,9 @@ import errno
 import inspect
 import json
 import logging
+import os
 import stat
+import time
 from pathlib import Path
 
 import pytest
@@ -135,6 +137,20 @@ def test_save_atomic_failure_does_not_corrupt_existing_file(
     assert response.status_code == 500
     assert target.read_text(encoding="utf-8") == "original"
     assert list(tmp_path.glob(".file-bridge-*.tmp")) == []
+
+
+def test_save_maps_storage_einval_to_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_write(_path: Path, _text: str) -> None:
+        raise OSError(errno.EINVAL, "simulated storage failure")
+
+    monkeypatch.setattr(main, "_atomic_write_text", fail_write)
+
+    response = client.post("/save", json={"text": "no", "path": "target.txt"})
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Failed to save text"}
 
 
 def test_save_encoding_failure_removes_temp_file(
@@ -290,6 +306,18 @@ def test_paths_skips_directory_entries_that_are_not_valid_utf8(
 
     assert response.status_code == 200
     assert response.json() == {"paths": ["valid.txt"]}
+
+
+def test_paths_excludes_internal_temporary_files(
+    client: TestClient, tmp_path: Path
+) -> None:
+    (tmp_path / ".file-bridge-abcdefgh.tmp").write_text("partial", encoding="utf-8")
+    (tmp_path / "visible.txt").write_text("ok", encoding="utf-8")
+
+    response = client.get("/paths")
+
+    assert response.status_code == 200
+    assert response.json() == {"paths": ["visible.txt"]}
 
 
 def test_paths_treats_backslash_as_a_posix_filename_character(
@@ -674,6 +702,50 @@ def test_startup_rejects_save_root_that_is_not_a_directory(
     with pytest.raises(RuntimeError, match="save_root is not a directory"):
         with TestClient(main.app):
             pass
+
+
+def test_startup_rejects_save_root_inside_application_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        main, "RUNTIME_CONFIG", main.AppConfig(save_root=main.APPLICATION_ROOT)
+    )
+
+    with pytest.raises(RuntimeError, match="inside the application directory"):
+        with TestClient(main.app):
+            pass
+
+
+def test_startup_removes_only_old_owned_temporary_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stale = tmp_path / ".file-bridge-abcdefgh.tmp"
+    fresh = tmp_path / ".file-bridge-ijklmnop.tmp"
+    stale.write_text("stale", encoding="utf-8")
+    fresh.write_text("fresh", encoding="utf-8")
+    old_timestamp = time.time() - main.STALE_TEMP_FILE_AGE_SECONDS - 1
+    os.utime(stale, (old_timestamp, old_timestamp))
+    monkeypatch.setattr(main, "RUNTIME_CONFIG", main.AppConfig(save_root=tmp_path))
+
+    with TestClient(main.app):
+        pass
+
+    assert not stale.exists()
+    assert fresh.exists()
+
+
+def test_stale_temp_cleanup_preserves_files_owned_by_another_user(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stale = tmp_path / ".file-bridge-abcdefgh.tmp"
+    stale.write_text("stale", encoding="utf-8")
+    old_timestamp = time.time() - main.STALE_TEMP_FILE_AGE_SECONDS - 1
+    os.utime(stale, (old_timestamp, old_timestamp))
+    monkeypatch.setattr(main.os, "getuid", lambda: stale.stat().st_uid + 1)
+
+    main._cleanup_stale_temp_files(tmp_path)
+
+    assert stale.exists()
 
 
 def test_startup_rejects_inaccessible_save_root(

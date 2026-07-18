@@ -99,7 +99,7 @@ class AppConfig:
         object.__setattr__(self, "save_root", save_root)
 
 
-class UniqueKeyLoader(yaml.SafeLoader):
+class UniqueKeyLoader(yaml.SafeLoader):  # type: ignore[misc]
     """Safe YAML loader that refuses ambiguous duplicate mapping keys."""
 
     def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:

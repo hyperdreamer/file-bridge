@@ -8,6 +8,7 @@ import os
 import shutil
 import socket
 import stat
+import sys
 import time
 from collections.abc import Generator
 from pathlib import Path
@@ -1392,6 +1393,29 @@ def test_stale_cleanup_does_not_follow_symlinks(
         assert stale.exists()
     finally:
         shutil.rmtree(outside_dir, ignore_errors=True)
+
+
+def test_stale_cleanup_handles_nesting_beyond_recursion_limit(tmp_path: Path) -> None:
+    recursion_limit = 200
+    depth = recursion_limit + 50
+    current = tmp_path
+    for _ in range(depth):
+        current = current / "d"
+        current.mkdir()
+
+    stale = current / ".file-bridge-abcdefgh.tmp"
+    stale.write_text("stale", encoding="utf-8")
+    old_timestamp = time.time() - main.STALE_TEMP_FILE_AGE_SECONDS - 1
+    os.utime(stale, (old_timestamp, old_timestamp))
+
+    original_recursion_limit = sys.getrecursionlimit()
+    try:
+        sys.setrecursionlimit(recursion_limit)
+        main._cleanup_stale_temp_files(tmp_path)
+    finally:
+        sys.setrecursionlimit(original_recursion_limit)
+
+    assert not stale.exists()
 
 
 # ---------------------------------------------------------------------------

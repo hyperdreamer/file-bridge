@@ -435,7 +435,9 @@ def _cleanup_stale_temp_files(save_root: Path) -> None:
         scanned += 1
         return True
 
-    def _scan_dir(directory: Path) -> None:
+    stack = [save_root]
+    while stack:
+        directory = stack.pop()
         try:
             with os.scandir(directory) as dir_entries:
                 for entry in dir_entries:
@@ -454,7 +456,7 @@ def _cleanup_stale_temp_files(save_root: Path) -> None:
                         dir_path = Path(entry.path)
                         if _is_within(dir_path, APPLICATION_ROOT):
                             continue
-                        _scan_dir(dir_path)
+                        stack.append(dir_path)
                     elif TEMP_FILE_PATTERN.fullmatch(entry.name):
                         try:
                             entry_stat = entry.stat(follow_symlinks=False)
@@ -477,8 +479,6 @@ def _cleanup_stale_temp_files(save_root: Path) -> None:
                 exc_info=True,
                 extra={"event": "temp_cleanup_scan_failed"},
             )
-
-    _scan_dir(save_root)
 
 
 def _probe_save_root(save_root: Path) -> None:

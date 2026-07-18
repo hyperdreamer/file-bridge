@@ -234,7 +234,7 @@ def _expand_user_path(raw_path: str, save_root: Path) -> Path:
         raise HTTPException(status_code=400, detail="Invalid path: contains a NUL byte")
 
     try:
-        candidate = Path(raw_path).expanduser()
+        candidate = save_root / raw_path[2:] if raw_path.startswith("~/") else Path(raw_path).expanduser()
         path = candidate if candidate.is_absolute() else save_root / candidate
         clean = Path(os.path.normpath(str(path)))
     except (OSError, RuntimeError, ValueError) as exc:

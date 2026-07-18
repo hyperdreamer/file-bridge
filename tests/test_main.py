@@ -35,6 +35,17 @@ def test_save_creates_file_and_returns_path(client: TestClient, tmp_path: Path) 
     assert expected.read_text(encoding="utf-8") == "hello"
 
 
+def test_save_expands_tilde_slash_relative_to_save_root(
+    client: TestClient, tmp_path: Path
+) -> None:
+    response = client.post("/save", json={"text": "hello", "path": "~/test.txt"})
+
+    expected = (tmp_path / "test.txt").resolve()
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "path": str(expected)}
+    assert expected.read_text(encoding="utf-8") == "hello"
+
+
 def test_save_accepts_absolute_paths_inside_save_root(client: TestClient, tmp_path: Path) -> None:
     target = tmp_path / "absolute.txt"
 
@@ -50,6 +61,18 @@ def test_save_rejects_paths_outside_save_root(client: TestClient, tmp_path: Path
 
     assert response.status_code == 400
     assert not (tmp_path.parent / "outside.txt").exists()
+
+
+def test_save_rejects_absolute_path_outside_save_root(
+    client: TestClient, tmp_path: Path
+) -> None:
+    outside = Path("/tmp/outside.txt")
+    assert not outside.is_relative_to(tmp_path)
+
+    response = client.post("/save", json={"text": "no", "path": str(outside)})
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "Save path must stay under configured save_root"}
 
 
 def test_save_rejects_non_utf8_path_without_side_effects(

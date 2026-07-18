@@ -762,6 +762,8 @@ def list_paths(prefix: str = "") -> PathsResponse:
     results = []
     for name, is_directory in paths:
         relative_path = str(relative_directory / name)
+        if not is_directory and relative_path == prefix:
+            continue
         if is_directory:
             relative_path += "/"
         results.append(relative_path)

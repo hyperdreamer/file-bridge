@@ -238,6 +238,16 @@ def test_paths_filters_by_prefix(client: TestClient, tmp_path: Path) -> None:
     assert response.json() == {"paths": ["notes/today.md", "notes/tomorrow.md"]}
 
 
+def test_paths_omits_exact_file_match(client: TestClient, tmp_path: Path) -> None:
+    (tmp_path / "tts.txt").write_text("complete", encoding="utf-8")
+    (tmp_path / "tts.txt.backup").write_text("backup", encoding="utf-8")
+
+    response = client.get("/paths", params={"prefix": "tts.txt"})
+
+    assert response.status_code == 200
+    assert response.json() == {"paths": ["tts.txt.backup"]}
+
+
 def test_paths_lists_directory_contents_when_prefix_ends_with_slash(
     client: TestClient, tmp_path: Path
 ) -> None:

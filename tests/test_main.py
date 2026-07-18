@@ -252,18 +252,17 @@ def test_paths_lists_directory_contents_when_prefix_ends_with_slash(
     assert response.json() == {"paths": ["notes/archive/", "notes/today.md"]}
 
 
-def test_paths_lists_directory_contents_for_exact_directory_prefix(
-    client: TestClient, tmp_path: Path
-) -> None:
+def test_paths_filters_exact_directory_name_as_prefix(client: TestClient, tmp_path: Path) -> None:
     notes = tmp_path / "notes"
     notes.mkdir()
     (notes / "today.md").write_text("today", encoding="utf-8")
     (notes / "archive").mkdir()
+    (tmp_path / "notes-backup").mkdir()
 
     response = client.get("/paths", params={"prefix": "notes"})
 
     assert response.status_code == 200
-    assert response.json() == {"paths": ["notes/archive/", "notes/today.md"]}
+    assert response.json() == {"paths": ["notes/", "notes-backup/"]}
 
 
 def test_paths_returns_at_most_30_results(client: TestClient, tmp_path: Path) -> None:

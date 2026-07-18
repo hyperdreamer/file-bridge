@@ -698,19 +698,12 @@ def list_paths(prefix: str = "") -> PathsResponse:
     config = _get_runtime_config()
     save_root = config.save_root
     prefix_ends_with_separator = prefix.endswith("/")
-    exact_directory = False
 
     if prefix:
         search_dir = _expand_user_path(prefix, save_root)
         if not _is_within(search_dir, save_root):
             return PathsResponse(paths=[])
-        try:
-            exact_directory = search_dir.is_dir()
-        except OSError as exc:
-            if exc.errno in INVALID_PATH_ERRNOS:
-                raise _invalid_path(exc) from exc
-            exact_directory = False
-        if not prefix_ends_with_separator and not exact_directory:
+        if not prefix_ends_with_separator:
             search_dir = search_dir.parent
     else:
         search_dir = save_root
@@ -719,7 +712,7 @@ def list_paths(prefix: str = "") -> PathsResponse:
         return PathsResponse(paths=[])
 
     prefix_lower = ""
-    if prefix and not prefix_ends_with_separator and not exact_directory:
+    if prefix and not prefix_ends_with_separator:
         raw_name = Path(prefix).name.lower()
         if raw_name and raw_name != "~":
             prefix_lower = raw_name

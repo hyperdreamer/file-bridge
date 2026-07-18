@@ -620,7 +620,7 @@ class RequestMiddleware:
             REQUEST_ID.reset(token)
 
 
-app = FastAPI(title="File Bridge", version="0.0.3", lifespan=lifespan)
+app = FastAPI(title="File Bridge", version="0.0.4", lifespan=lifespan)
 app.add_middleware(RequestMiddleware)
 
 
@@ -859,14 +859,33 @@ def main() -> int:
         LOGGER.info("configuration is valid", extra={"event": "config_valid"})
         return 0
 
+    import socket
     import uvicorn
 
-    uvicorn.run(
-        app,
-        host=BIND_HOST,
-        port=RUNTIME_CONFIG.port,
-        log_config=None,
-    )
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        server_socket.bind((BIND_HOST, RUNTIME_CONFIG.port))
+        server_socket.listen(2048)
+    except OSError as exc:
+        LOGGER.critical(
+            "cannot bind to %s:%d: %s",
+            BIND_HOST,
+            RUNTIME_CONFIG.port,
+            exc,
+            extra={"event": "bind_failed"},
+        )
+        return 1
+
+    sock_fd = server_socket.fileno()
+    try:
+        uvicorn.run(
+            app,
+            fd=sock_fd,
+            log_config=None,
+        )
+    finally:
+        server_socket.close()
     return 0
 
 

@@ -29,7 +29,7 @@ Start the service with:
 ```
 
 The server always binds to `127.0.0.1` and uses the configured port (default
-`8766`). `start.sh` checks the virtual environment, configuration file, and
+`8964`). `start.sh` checks the virtual environment, configuration file, and
 save root first, then prints actionable diagnostics if startup cannot proceed.
 
 ## Configuration and limits

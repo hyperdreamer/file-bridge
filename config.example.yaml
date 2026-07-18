@@ -7,4 +7,4 @@ save_root: "~"
 max_text_bytes: 1048576
 
 # Server port (always binds to 127.0.0.1 only).
-port: 8766
+port: 8964

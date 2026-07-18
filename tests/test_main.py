@@ -435,7 +435,7 @@ def test_config_defaults_port(tmp_path: Path) -> None:
     config_path.write_text("", encoding="utf-8")
     config = main.load_config(path=config_path)
 
-    assert config.port == 8766
+    assert config.port == main.DEFAULT_PORT
     assert config.max_text_bytes == main.DEFAULT_MAX_TEXT_BYTES
     assert config.save_root == Path("~").expanduser().resolve()
 

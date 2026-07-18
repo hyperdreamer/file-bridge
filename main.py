@@ -33,6 +33,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 APPLICATION_ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = Path(__file__).with_name("config.yaml")
 DEFAULT_SAVE_ROOT = "~"
+DEFAULT_PORT = 8964
 DEFAULT_MAX_TEXT_BYTES = 1_048_576
 MAX_MAX_TEXT_BYTES = 100 * 1_048_576
 REQUEST_BODY_OVERHEAD_BYTES = 65_536
@@ -87,7 +88,7 @@ class AppConfig:
     """Application settings loaded from config.yaml."""
 
     save_root: Path = Path(DEFAULT_SAVE_ROOT)
-    port: int = 8766
+    port: int = DEFAULT_PORT
     max_text_bytes: int = DEFAULT_MAX_TEXT_BYTES
 
     def __post_init__(self) -> None:
@@ -170,7 +171,7 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     if not save_root_path.is_absolute():
         save_root_path = path.parent / save_root_path
 
-    port = raw_config.get("port", 8766)
+    port = raw_config.get("port", DEFAULT_PORT)
     if type(port) is not int:
         raise RuntimeError("config port must be an integer from 1 to 65535")
     if not 1 <= port <= 65535:

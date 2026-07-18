@@ -620,7 +620,7 @@ class RequestMiddleware:
             REQUEST_ID.reset(token)
 
 
-app = FastAPI(title="File Bridge", version="0.0.4", lifespan=lifespan)
+app = FastAPI(title="File Bridge", lifespan=lifespan)
 app.add_middleware(RequestMiddleware)
 
 

@@ -31,14 +31,15 @@ this directory" semantics are required for correctness.
 ## #2 — No Token Authentication
 
 **What:** The `/save` endpoint has no bearer token, API key, or credential
-storage. Loopback binding plus Host/Origin validation are the only access
+storage. Loopback binding plus Host validation are the only access
 controls.
 
 **Why it's not an issue:** The service binds exclusively to `127.0.0.1` and
 validates the HTTP `Host` header is a loopback address (`127.0.0.1`, `localhost`,
-or `[::1]`). Browser-originated requests with a non-loopback `Origin` header are
-rejected. Any local process with network access to loopback already has
-filesystem access to the user's files, making an API token redundant.
+or `[::1]`). Origin headers are intentionally not validated to preserve
+compatibility with browser extensions. Any local process with network access to
+loopback already has filesystem access to the user's files, making an API token
+redundant.
 
 Authentication is an intentional design choice — the threat model treats local
 clients as trusted.

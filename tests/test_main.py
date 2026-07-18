@@ -993,7 +993,7 @@ def test_save_rejects_reserved_temp_filename(client: TestClient) -> None:
 
 
 # ---------------------------------------------------------------------------
-# MEDIUM 1 — Host / Origin validation
+# MEDIUM 1 — Host validation
 # ---------------------------------------------------------------------------
 
 
@@ -1013,30 +1013,7 @@ def test_host_header_rejects_external(client: TestClient) -> None:
     assert response.json() == {"detail": "Misdirected Request"}
 
 
-def test_origin_header_rejects_null(client: TestClient) -> None:
-    """Opaque origins (null) are untrusted and must be rejected."""
-    response = client.get("/health", headers={"Origin": "null"})
-    assert response.status_code == 403
-
-
-def test_origin_header_accepts_loopback(client: TestClient) -> None:
-    response = client.get("/health", headers={"Origin": "http://127.0.0.1:8964"})
-    assert response.status_code == 200
-
-
-def test_origin_header_rejects_external(client: TestClient) -> None:
-    response = client.get("/health", headers={"Origin": "http://evil.example.com"})
-    assert response.status_code == 403
-    assert response.json() == {"detail": "Forbidden"}
-
-
-def test_no_origin_is_accepted(client: TestClient) -> None:
-    """Non-browser localhost clients typically send no Origin header."""
-    response = client.get("/health")
-    assert response.status_code == 200
-
-
-# -- Host / Origin: IPv6, port range, and malformed inputs ------------------
+# -- Host: IPv6, port range, and malformed inputs ---------------------------
 
 
 @pytest.mark.parametrize(
@@ -1080,51 +1057,46 @@ def test_host_header_rejects_invalid_loopback(client: TestClient, host_value: st
     assert response.status_code == 421
 
 
-@pytest.mark.parametrize(
-    "origin_value",
-    [
-        "http://127.0.0.1",
-        "http://127.0.0.1:8964",
-        "http://localhost",
-        "http://localhost:8964",
-        "http://[::1]",
-        "http://[::1]:8964",
-        "https://127.0.0.1",
-        "https://localhost:8964",
-    ],
-)
-def test_origin_header_accepts_valid_loopback(client: TestClient, origin_value: str) -> None:
-    response = client.get("/health", headers={"Origin": origin_value})
-    assert response.status_code == 200
-
-
-@pytest.mark.parametrize(
-    "origin_value",
-    [
-        "http://127.0.0.1:0",
-        "http://127.0.0.1:99999",
-        "http://localhost:65536",
-        "http://[::1]:0",
-        # Non-loopback origins
-        "http://evil.example.com",
-        "https://example.com:443",
-        "http://127.0.0.2",
-        "http://[::2]",
-        # Malformed
-        "file://127.0.0.1",
-        "http://user@127.0.0.1:8964",
-        "http://127.0.0.1/path",
-        "",
-    ],
-)
-def test_origin_header_rejects_invalid(client: TestClient, origin_value: str) -> None:
-    response = client.get("/health", headers={"Origin": origin_value})
-    assert response.status_code == 403
-
-
 # ---------------------------------------------------------------------------
 # MEDIUM 2 — transport body cap
 # ---------------------------------------------------------------------------
+
+
+def test_save_accepts_chrome_extension_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Origin is intentionally ignored for browser-extension compatibility."""
+    config = main.AppConfig(save_root=tmp_path)
+    monkeypatch.setattr(main, "RUNTIME_CONFIG", config)
+    with TestClient(main.app, base_url="http://127.0.0.1:8964") as client:
+        response = client.post(
+            "/save",
+            json={"text": "hello from extension", "path": "ext-saved.txt"},
+            headers={
+                "Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+            },
+        )
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    assert (tmp_path / "ext-saved.txt").read_text(encoding="utf-8") == (
+        "hello from extension"
+    )
+
+
+def test_save_rejects_non_loopback_host_regardless_of_origin(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """Host rejection remains active even when Origin is a browser extension."""
+    response = client.post(
+        "/save",
+        json={"text": "no", "path": "host-block.txt"},
+        headers={
+            "Host": "evil.example.com",
+            "Origin": "chrome-extension://abcdefghijklmnopabcdefghijklmnop",
+        },
+    )
+    assert response.status_code == 421
+    assert not (tmp_path / "host-block.txt").exists()
 
 
 def test_transport_cap_enforced_when_max_text_bytes_is_zero(
@@ -1882,7 +1854,6 @@ def test_bodyless_drain_disconnect_during_oversized_drain(
     ("code", "headers"),
     [
         (421, []),  # Missing/foreign Host header
-        (403, [(b"host", b"127.0.0.1:8964"), (b"origin", b"http://evil.example.com")]),  # External origin
         (
             413,
             [

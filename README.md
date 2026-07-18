@@ -43,10 +43,14 @@ Regardless of this setting, the raw request body is always bounded by a hard
 transport safety cap of 128 MiB.
 
 The server validates the HTTP `Host` header is a loopback address (missing or
-non-loopback values are rejected with HTTP 421) and rejects non-loopback
-`Origin` headers (HTTP 403). These checks prevent DNS rebinding
-attacks from browser contexts while preserving direct non-browser localhost
-clients that do not send an `Origin` header.
+non-loopback values are rejected with HTTP 421). This guards against
+DNS-rebinding attacks when the service is accessed through a browser context.
+Origin headers are intentionally **not** validated — this preserves
+compatibility with browser extensions (e.g. `chrome-extension://<id>`) that
+send a non-loopback Origin. The binding to `127.0.0.1`, the loopback-only
+Host check, and the requirement that the service must never be exposed
+through `0.0.0.0`, reverse proxies, port forwarding, or tunnels together
+constitute the security model.
 
 Atomic overwrites preserve existing Unix mode bits. New parent directories,
 file data, permission changes, and the final directory entry are synced for
@@ -59,6 +63,20 @@ Containment is enforced **lexically** (via `os.path.normpath()` and
 symlinks within `save_root` are trusted same-user filesystem entries and may
 resolve outside the root. This preserves usability for patterns such as
 `~/Ramdisk` → `/ramdisk`.
+
+## Threat model
+
+file-bridge is a **trusted-user localhost utility**. It must:
+
+- Bind exclusively to `127.0.0.1` — never expose it on `0.0.0.0`.
+- Not be placed behind a reverse proxy, port forwarding, or tunneling service.
+- Rely on Host-header validation (HTTP 421 for missing/non-loopback hosts)
+  to mitigate DNS-rebinding attacks in browser contexts.
+
+Origin filtering is intentionally absent: browser extensions such as
+`chrome-extension://<id>` send non-loopback Origin values and would be
+unnecessarily blocked. The Host check, combined with the hard `127.0.0.1`
+bind, provides the necessary rebinding defence.
 
 ## API
 
@@ -78,8 +96,7 @@ discussion above). Request bodies reject unknown fields. Empty and
 whitespace-only save paths are invalid; leading or trailing whitespace on a
 non-empty filename is preserved rather than silently stripped. Invalid paths,
 including destination type conflicts, return HTTP 400. Oversized requests
-return HTTP 413. Misdirected requests with a missing or non-loopback `Host` header return
-HTTP 421. Browser requests with a non-loopback `Origin` return HTTP 403.
+return HTTP 413. Misdirected requests with a missing or non-loopback `Host` header return HTTP 421.
 
 Every response includes `X-Request-ID`. Clients may supply an ID containing
 ASCII letters, digits, `.`, `_`, or `-`; otherwise the service generates one.

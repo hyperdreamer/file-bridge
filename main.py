@@ -602,28 +602,6 @@ def _validate_loopback_host(host_value: str | None) -> bool:
     return host.lower() in _LOOPBACK_IDENTS
 
 
-# Match loopback HTTP/HTTPS origins with an optional numeric port.
-_ORIGIN_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost|\[::1\])(?::(\d+))?")
-
-
-def _validate_browser_origin(origin_value: str | None) -> bool:
-    """Return True when the Origin is absent (non-browser) or a loopback origin."""
-    if origin_value is None:
-        return True
-    # Opaque origins (null) are untrusted — reject them.
-    if origin_value == "null":
-        return False
-    m = _ORIGIN_RE.fullmatch(origin_value)
-    if m is None:
-        return False
-    port_str = m.group(1)
-    if port_str is not None:
-        port = int(port_str)
-        if not 1 <= port <= 65535:
-            return False
-    return True
-
-
 class _LimitedReceive:
     """Wraps an ASGI *receive* callable, counting cumulative bytes.
 
@@ -666,7 +644,7 @@ class _LimitedReceive:
 
 
 class RequestMiddleware:
-    """Attach request IDs, validate Host/Origin, log requests, and bound bodies."""
+    """Attach request IDs, validate Host, log requests, and bound bodies."""
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -708,12 +686,6 @@ class RequestMiddleware:
             host_value = _header_value(scope, b"host")
             if not _validate_loopback_host(host_value):
                 await _error_response(421, "Misdirected Request")
-                return
-
-            # Validate Origin for browser-originated requests
-            origin_value = _header_value(scope, b"origin")
-            if not _validate_browser_origin(origin_value):
-                await _error_response(403, "Forbidden")
                 return
 
             # Reject declared request bodies on methods that do not accept one.

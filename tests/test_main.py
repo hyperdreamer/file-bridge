@@ -1871,3 +1871,85 @@ def test_bodyless_drain_disconnect_during_oversized_drain(
     ]
     assert len(request_complete) == 1
     assert getattr(request_complete[0], "status_code", 500) is None
+
+
+# ---------------------------------------------------------------------------
+# LOW — middleware error response must be tracked before send awaits
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("code", "headers"),
+    [
+        (421, []),  # Missing/foreign Host header
+        (403, [(b"host", b"127.0.0.1:8964"), (b"origin", b"http://evil.example.com")]),  # External origin
+        (
+            413,
+            [
+                (b"host", b"127.0.0.1:8964"),
+                (
+                    b"content-length",
+                    str(main.MAX_TRANSPORT_BODY_BYTES + 1).encode(),
+                ),
+            ],
+        ),
+    ],
+)
+def test_middleware_error_response_does_not_retry_on_send_failure(
+    caplog: pytest.LogCaptureFixture, code: int, headers: list[tuple[bytes, bytes]]
+) -> None:
+    """When ``send`` raises during a middleware-generated error response,
+    the outer exception handler must not attempt a second (500) response
+    and ``request_complete`` must retain the original status.
+
+    Regression for: ``_error_response`` previously did not mark
+    ``response_sent`` before awaiting the response, so a send failure
+    caused the outer ``except`` to overwrite the status with 500 and
+    attempt a second response-start.
+    """
+    import asyncio
+
+    async def _drive() -> None:
+        scope: dict[str, Any] = {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "path": "/health",
+            "raw_path": b"/health",
+            "query_string": b"",
+            "headers": headers,
+        }
+        messages: list[dict[str, Any]] = []
+
+        async def receive() -> dict[str, Any]:
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message: dict[str, Any]) -> None:
+            messages.append(message)
+            # Raise on response-start; the middleware must not retry
+            # with a 500 fallback response.
+            if message["type"] == "http.response.start":
+                raise RuntimeError("simulated client disconnect")
+
+        await main.app(scope, receive, send)  # type: ignore[arg-type]
+
+        response_starts = [
+            m for m in messages if m["type"] == "http.response.start"
+        ]
+        # Exactly one start attempt — no 500 fallback.
+        assert len(response_starts) == 1, (
+            f"expected one response-start attempt, got {len(response_starts)}: "
+            f"{response_starts}"
+        )
+
+    with caplog.at_level(logging.INFO, logger=main.LOGGER.name):
+        asyncio.run(_drive())
+
+    request_complete = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "request_complete"
+    ]
+    assert len(request_complete) == 1
+    # The structured log must preserve the original status, not 500.
+    assert getattr(request_complete[0], "status_code", 500) == code

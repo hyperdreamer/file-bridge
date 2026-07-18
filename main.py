@@ -682,6 +682,7 @@ class RequestMiddleware:
         token = REQUEST_ID.set(request_id)
         started = time.monotonic()
         status_code: int | None = 500
+        response_sent = False
 
         async def send_with_request_id(message: Message) -> None:
             nonlocal status_code
@@ -693,15 +694,15 @@ class RequestMiddleware:
             await send(message)
 
         async def _error_response(code: int, detail: str) -> None:
-            nonlocal status_code
+            nonlocal status_code, response_sent
             status_code = code
+            response_sent = True
             response = JSONResponse(status_code=code, content={"detail": detail})
             await response(scope, receive, send_with_request_id)
 
         # ------------------------------------------------------------------
         # Capped receive — counts bytes as downstream consumes the body
         # without buffering the entire request in the middleware.
-        response_sent = False
         try:
             # Validate Host header is loopback
             host_value = _header_value(scope, b"host")

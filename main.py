@@ -234,7 +234,9 @@ def _expand_user_path(raw_path: str, save_root: Path) -> Path:
         raise HTTPException(status_code=400, detail="Invalid path: contains a NUL byte")
 
     try:
-        candidate = save_root / raw_path[2:] if raw_path.startswith("~/") else Path(raw_path).expanduser()
+        candidate = (
+            save_root / raw_path[2:] if raw_path.startswith("~/") else Path(raw_path).expanduser()
+        )
         path = candidate if candidate.is_absolute() else save_root / candidate
         clean = Path(os.path.normpath(str(path)))
     except (OSError, RuntimeError, ValueError) as exc:
@@ -273,11 +275,6 @@ def _resolve_save_path(raw_path: str, config: AppConfig) -> Path:
         resolved = clean.resolve()
     except (OSError, RuntimeError, ValueError) as exc:
         raise _invalid_path(exc) from exc
-    if _is_within(resolved, APPLICATION_ROOT):
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot save inside the file-bridge application directory",
-        )
 
     return resolved
 
@@ -629,8 +626,7 @@ async def request_validation_exception_handler(
     _request: Request, exc: RequestValidationError
 ) -> JSONResponse:
     errors = [
-        {key: value for key, value in error.items() if key != "input"}
-        for error in exc.errors()
+        {key: value for key, value in error.items() if key != "input"} for error in exc.errors()
     ]
     return JSONResponse(status_code=422, content={"detail": errors})
 
@@ -724,8 +720,6 @@ def list_paths(prefix: str = "") -> PathsResponse:
         return PathsResponse(paths=[])
     if not _is_within(resolved_search_dir, save_root):
         return PathsResponse(paths=[])
-    if _is_within(resolved_search_dir, APPLICATION_ROOT):
-        return PathsResponse(paths=[])
     if not resolved_search_dir.is_dir():
         return PathsResponse(paths=[])
 
@@ -754,8 +748,6 @@ def list_paths(prefix: str = "") -> PathsResponse:
                 try:
                     resolved_entry = Path(entry.path).resolve()
                     if not _is_within(resolved_entry, save_root):
-                        continue
-                    if _is_within(resolved_entry, APPLICATION_ROOT):
                         continue
                     is_directory = resolved_entry.is_dir()
                 except (OSError, RuntimeError):

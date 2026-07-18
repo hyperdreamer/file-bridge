@@ -12,7 +12,6 @@ from collections.abc import Generator
 from pathlib import Path
 
 import pytest
-from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import main
@@ -35,9 +34,7 @@ def test_save_creates_file_and_returns_path(client: TestClient, tmp_path: Path) 
     assert expected.read_text(encoding="utf-8") == "hello"
 
 
-def test_save_expands_tilde_slash_relative_to_save_root(
-    client: TestClient, tmp_path: Path
-) -> None:
+def test_save_expands_tilde_slash_relative_to_save_root(client: TestClient, tmp_path: Path) -> None:
     response = client.post("/save", json={"text": "hello", "path": "~/test.txt"})
 
     expected = (tmp_path / "test.txt").resolve()
@@ -63,9 +60,7 @@ def test_save_rejects_paths_outside_save_root(client: TestClient, tmp_path: Path
     assert not (tmp_path.parent / "outside.txt").exists()
 
 
-def test_save_rejects_absolute_path_outside_save_root(
-    client: TestClient, tmp_path: Path
-) -> None:
+def test_save_rejects_absolute_path_outside_save_root(client: TestClient, tmp_path: Path) -> None:
     outside = Path("/tmp/outside.txt")
     assert not outside.is_relative_to(tmp_path)
 
@@ -545,32 +540,12 @@ def test_save_accepts_absolute_path_with_normalized_relative_root(
 
 
 @pytest.mark.parametrize("filename", ["config.yaml", "main.py"])
-def test_resolve_save_path_rejects_application_files(filename: str) -> None:
+def test_resolve_save_path_accepts_application_files_within_save_root(filename: str) -> None:
     config = main.AppConfig(save_root=main.APPLICATION_ROOT.parent)
 
-    with pytest.raises(
-        HTTPException,
-        match="Cannot save inside the file-bridge application directory",
-    ) as exc_info:
-        main._resolve_save_path(str(main.APPLICATION_ROOT / filename), config)
+    resolved = main._resolve_save_path(str(main.APPLICATION_ROOT / filename), config)
 
-    assert exc_info.value.status_code == 400
-
-
-def test_resolve_save_path_rejects_symlink_into_application_directory(
-    tmp_path: Path,
-) -> None:
-    application_link = tmp_path / "application"
-    application_link.symlink_to(main.APPLICATION_ROOT, target_is_directory=True)
-    config = main.AppConfig(save_root=tmp_path)
-
-    with pytest.raises(
-        HTTPException,
-        match="Cannot save inside the file-bridge application directory",
-    ) as exc_info:
-        main._resolve_save_path(str(application_link / "main.py"), config)
-
-    assert exc_info.value.status_code == 400
+    assert resolved == main.APPLICATION_ROOT / filename
 
 
 @pytest.mark.parametrize("path", ["bad\x00name.txt", "~definitely-no-such-user/file.txt"])
@@ -624,9 +599,7 @@ def test_save_rejects_wrong_type_field_with_unpaired_surrogate(
     assert list(tmp_path.iterdir()) == []
 
 
-def test_save_rejects_root_body_with_unpaired_surrogate(
-    client: TestClient, tmp_path: Path
-) -> None:
+def test_save_rejects_root_body_with_unpaired_surrogate(client: TestClient, tmp_path: Path) -> None:
     response = client.post(
         "/save",
         content=b'"\\ud800"',
@@ -675,15 +648,22 @@ def test_paths_preserves_safe_internal_symlink_prefix(
     assert response.json() == {"paths": ["alias/note.txt"]}
 
 
-def test_paths_excludes_application_directory(monkeypatch: pytest.MonkeyPatch) -> None:
-    save_root = main.APPLICATION_ROOT.parent
+def test_paths_includes_application_directory_via_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    save_root = tmp_path / "root"
+    application_root = save_root / "application"
+    application_root.mkdir(parents=True)
+    (application_root / "main.py").write_text("", encoding="utf-8")
+    (save_root / "application-link").symlink_to(application_root, target_is_directory=True)
+    monkeypatch.setattr(main, "APPLICATION_ROOT", application_root)
     monkeypatch.setattr(main, "RUNTIME_CONFIG", main.AppConfig(save_root=save_root))
 
     with TestClient(main.app) as client:
-        response = client.get("/paths")
+        response = client.get("/paths", params={"prefix": "application-link/"})
 
     assert response.status_code == 200
-    assert f"{main.APPLICATION_ROOT.name}/" not in response.json()["paths"]
+    assert response.json() == {"paths": ["application-link/main.py"]}
 
 
 def test_request_body_limit_rejects_before_json_parsing(

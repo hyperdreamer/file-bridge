@@ -681,7 +681,7 @@ class RequestMiddleware:
             request_id = uuid.uuid4().hex
         token = REQUEST_ID.set(request_id)
         started = time.monotonic()
-        status_code = 500
+        status_code: int | None = 500
 
         async def send_with_request_id(message: Message) -> None:
             nonlocal status_code
@@ -740,6 +740,7 @@ class RequestMiddleware:
                             # Client disconnected while draining the
                             # declared body — no client remains to
                             # receive a response.
+                            status_code = None
                             return
                         if message["type"] != "http.request":
                             continue
@@ -755,6 +756,7 @@ class RequestMiddleware:
                                     break
                                 message = await receive()
                                 if message["type"] == "http.disconnect":
+                                    status_code = None
                                     return
                             break
                         if not message.get("more_body", False):

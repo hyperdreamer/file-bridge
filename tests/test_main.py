@@ -1676,7 +1676,9 @@ def test_get_without_body_still_works(client: TestClient) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_bodyless_drain_handles_disconnect_without_infinite_loop() -> None:
+def test_bodyless_drain_handles_disconnect_without_infinite_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Disconnect during bodyless-route drain must not spin forever.
 
     The ASGI spec allows ``receive()`` to return ``http.disconnect``
@@ -1723,7 +1725,16 @@ def test_bodyless_drain_handles_disconnect_without_infinite_loop() -> None:
             f"expected no response on disconnect, got {response_starts}"
         )
 
-    asyncio.run(_drive())
+    with caplog.at_level(logging.INFO, logger=main.LOGGER.name):
+        asyncio.run(_drive())
+
+    request_complete = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "request_complete"
+    ]
+    assert len(request_complete) == 1
+    assert getattr(request_complete[0], "status_code", 500) is None
 
 
 def test_bodyless_drain_rejects_oversized_multi_frame_stream() -> None:
@@ -1796,7 +1807,9 @@ def test_bodyless_drain_rejects_oversized_multi_frame_stream() -> None:
     asyncio.run(_drive())
 
 
-def test_bodyless_drain_disconnect_during_oversized_drain() -> None:
+def test_bodyless_drain_disconnect_during_oversized_drain(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """Disconnect while draining an oversized body must not spin.
 
     The first frame exceeds the transport cap and declares more body,
@@ -1848,4 +1861,13 @@ def test_bodyless_drain_disconnect_during_oversized_drain() -> None:
         ]
         assert len(response_starts) == 0
 
-    asyncio.run(_drive())
+    with caplog.at_level(logging.INFO, logger=main.LOGGER.name):
+        asyncio.run(_drive())
+
+    request_complete = [
+        record
+        for record in caplog.records
+        if getattr(record, "event", None) == "request_complete"
+    ]
+    assert len(request_complete) == 1
+    assert getattr(request_complete[0], "status_code", 500) is None

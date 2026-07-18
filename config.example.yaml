@@ -1,9 +1,12 @@
-# Save requests are constrained to this directory. Relative save paths are
-# resolved under this root, and absolute paths must also stay inside it.
-save_root: "~"
+# Save requests are constrained to this directory. Lexical containment is
+# enforced (../ traversal is prevented). Symlinks within save_root are trusted
+# same-user entries and may resolve outside the root. Replace with your chosen
+# directory; the example uses a dedicated path under the home directory.
+save_root: "~/file-bridge-data"
 
 # Maximum UTF-8 encoded text size in bytes. The default is 1 MiB. Set to 0 to
-# disable the decoded-text check.
+# disable the decoded-text check. Regardless of this setting, the raw request
+# body is bounded by a hard transport safety cap (128 MiB).
 max_text_bytes: 1048576
 
 # Server port (always binds to 127.0.0.1 only).

@@ -41,7 +41,9 @@ MAX_PATH_RESULTS = 30
 MAX_PATH_SCAN_ENTRIES = 300
 STALE_TEMP_FILE_AGE_SECONDS = 24 * 60 * 60
 MAX_CLEANUP_SCAN_ENTRIES = 10_000
+MAX_TRANSPORT_BODY_BYTES = 128 * 1_048_576
 BIND_HOST = "127.0.0.1"
+
 LOGGER = logging.getLogger("file_bridge")
 REQUEST_ID = contextvars.ContextVar("request_id", default="-")
 REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
@@ -99,7 +101,7 @@ class AppConfig:
         object.__setattr__(self, "save_root", save_root)
 
 
-class UniqueKeyLoader(yaml.SafeLoader):  # type: ignore[misc]
+class UniqueKeyLoader(yaml.SafeLoader):
     """Safe YAML loader that refuses ambiguous duplicate mapping keys."""
 
     def construct_mapping(self, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
@@ -129,17 +131,28 @@ class UniqueKeyLoader(yaml.SafeLoader):  # type: ignore[misc]
 
 def _load_yaml_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     try:
-        with path.open("r", encoding="utf-8") as config_file:
-            loaded = yaml.load(config_file, Loader=UniqueKeyLoader)
+        raw_text = path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
         raise RuntimeError(f"Configuration file not found: {path}") from exc
-    except (yaml.YAMLError, UnicodeError, ValueError) as exc:
-        raise RuntimeError(f"Invalid YAML in {path}: {exc}") from exc
     except OSError as exc:
         raise RuntimeError(f"Cannot read config file {path}: {exc}") from exc
 
+    # A document that contains only whitespace and YAML comments (lines
+    # whose first non-space character is '#') is considered blank and
+    # maps to an empty config.  Lines that follow comments and evaluate
+    # to null / ~ are NOT blank — they are explicit null documents.
+    _non_comment = re.sub(r"^\s*#.*$", "", raw_text, flags=re.MULTILINE)
+    is_blank = not _non_comment.strip()
+
+    try:
+        loaded = yaml.load(raw_text, Loader=UniqueKeyLoader)
+    except (yaml.YAMLError, UnicodeError, ValueError) as exc:
+        raise RuntimeError(f"Invalid YAML in {path}: {exc}") from exc
+
     if loaded is None:
-        return {}
+        if is_blank:
+            return {}
+        raise RuntimeError(f"{path} must contain a YAML mapping at the top level, not null")
     if not isinstance(loaded, dict):
         raise RuntimeError(f"{path} must contain a YAML mapping at the top level")
     return loaded
@@ -192,6 +205,8 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
 
 RUNTIME_CONFIG: AppConfig | None = None
 READY = False
+_SAVE_ROOT_DEVICE: int | None = None
+_SAVE_ROOT_INODE: int | None = None
 
 
 def _get_runtime_config() -> AppConfig:
@@ -276,6 +291,9 @@ def _resolve_save_path(raw_path: str, config: AppConfig) -> Path:
         resolved = clean.resolve()
     except (OSError, RuntimeError, ValueError) as exc:
         raise _invalid_path(exc) from exc
+
+    if TEMP_FILE_PATTERN.fullmatch(resolved.name):
+        raise HTTPException(status_code=400, detail="Save path uses a reserved filename pattern")
 
     return resolved
 
@@ -400,53 +418,67 @@ def _is_internal_temp_name(name: str) -> bool:
 
 
 def _cleanup_stale_temp_files(save_root: Path) -> None:
-    """Remove old bridge temp files owned by the current user without following links."""
+    """Remove old bridge temp files owned by the current user without following symlinks."""
 
     cutoff = time.time() - STALE_TEMP_FILE_AGE_SECONDS
     owner_id = os.getuid()
-
-    def log_walk_error(exc: OSError) -> None:
-        LOGGER.warning(
-            "cannot inspect directory for stale temporary files",
-            exc_info=(type(exc), exc, exc.__traceback__),
-            extra={"event": "temp_cleanup_scan_failed"},
-        )
-
     scanned = 0
-    for directory, directory_names, filenames in os.walk(
-        save_root, followlinks=False, onerror=log_walk_error
-    ):
+
+    def _record_scan() -> bool:
+        nonlocal scanned
         if scanned >= MAX_CLEANUP_SCAN_ENTRIES:
             LOGGER.warning(
                 "stale temp cleanup reached scan limit",
                 extra={"event": "temp_cleanup_scan_limit"},
             )
-            break
+            return False
         scanned += 1
-        directory_path = Path(directory)
-        if _is_within(directory_path, APPLICATION_ROOT):
-            directory_names.clear()
-            continue
+        return True
 
-        for filename in filenames:
-            if TEMP_FILE_PATTERN.fullmatch(filename) is None:
-                continue
-            temp_path = directory_path / filename
-            try:
-                temp_stat = temp_path.stat(follow_symlinks=False)
-                if (
-                    not stat.S_ISREG(temp_stat.st_mode)
-                    or temp_stat.st_uid != owner_id
-                    or temp_stat.st_mtime > cutoff
-                ):
-                    continue
-                temp_path.unlink()
-            except OSError:
-                LOGGER.warning(
-                    "failed to remove stale temporary save file",
-                    exc_info=True,
-                    extra={"event": "temp_cleanup_failed"},
-                )
+    def _scan_dir(directory: Path) -> None:
+        try:
+            with os.scandir(directory) as dir_entries:
+                for entry in dir_entries:
+                    if not _record_scan():
+                        return
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                    except OSError:
+                        LOGGER.warning(
+                            "cannot inspect directory entry for stale temporary files",
+                            exc_info=True,
+                            extra={"event": "temp_cleanup_scan_failed"},
+                        )
+                        continue
+                    if is_dir:
+                        dir_path = Path(entry.path)
+                        if _is_within(dir_path, APPLICATION_ROOT):
+                            continue
+                        _scan_dir(dir_path)
+                    elif TEMP_FILE_PATTERN.fullmatch(entry.name):
+                        try:
+                            entry_stat = entry.stat(follow_symlinks=False)
+                            if (
+                                not stat.S_ISREG(entry_stat.st_mode)
+                                or entry_stat.st_uid != owner_id
+                                or entry_stat.st_mtime > cutoff
+                            ):
+                                continue
+                            Path(entry.path).unlink()
+                        except OSError:
+                            LOGGER.warning(
+                                "failed to remove stale temporary save file",
+                                exc_info=True,
+                                extra={"event": "temp_cleanup_failed"},
+                            )
+        except OSError:
+            LOGGER.warning(
+                "cannot inspect directory for stale temporary files",
+                exc_info=True,
+                extra={"event": "temp_cleanup_scan_failed"},
+            )
+
+    _scan_dir(save_root)
 
 
 def _probe_save_root(save_root: Path) -> None:
@@ -462,6 +494,14 @@ def _probe_save_root(save_root: Path) -> None:
     if not stat.S_ISDIR(root_stat.st_mode):
         raise RuntimeError("save_root is not a directory")
 
+    global _SAVE_ROOT_DEVICE, _SAVE_ROOT_INODE
+    if _SAVE_ROOT_DEVICE is not None:
+        if (root_stat.st_dev, root_stat.st_ino) != (_SAVE_ROOT_DEVICE, _SAVE_ROOT_INODE):
+            raise RuntimeError(
+                "save_root identity changed (device or inode differs from startup); "
+                "the directory may have been recreated or replaced"
+            )
+
     try:
         with os.scandir(save_root) as entries:
             next(entries, None)
@@ -470,10 +510,14 @@ def _probe_save_root(save_root: Path) -> None:
     except OSError as exc:
         raise RuntimeError("save_root must be readable and writable") from exc
 
+    if _SAVE_ROOT_DEVICE is None:
+        _SAVE_ROOT_DEVICE = root_stat.st_dev
+        _SAVE_ROOT_INODE = root_stat.st_ino
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    global READY, RUNTIME_CONFIG
+    global READY, RUNTIME_CONFIG, _SAVE_ROOT_DEVICE, _SAVE_ROOT_INODE
 
     config = RUNTIME_CONFIG if RUNTIME_CONFIG is not None else load_config()
     try:
@@ -488,6 +532,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
                 "filesystem_path": str(config.save_root),
             },
         )
+        _SAVE_ROOT_DEVICE = None
+        _SAVE_ROOT_INODE = None
         raise RuntimeError(f"Startup validation failed: {exc}") from exc
 
     RUNTIME_CONFIG = config
@@ -505,13 +551,18 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         READY = False
+        _SAVE_ROOT_DEVICE = None
+        _SAVE_ROOT_INODE = None
         LOGGER.info("file-bridge stopped", extra={"event": "shutdown_complete"})
 
 
-def _request_body_limit(config: AppConfig) -> int | None:
+def _request_body_limit(config: AppConfig) -> int:
     if config.max_text_bytes == 0:
-        return None
-    return config.max_text_bytes * 6 + REQUEST_BODY_OVERHEAD_BYTES
+        return MAX_TRANSPORT_BODY_BYTES
+    return min(
+        config.max_text_bytes * 6 + REQUEST_BODY_OVERHEAD_BYTES,
+        MAX_TRANSPORT_BODY_BYTES,
+    )
 
 
 def _header_value(scope: Scope, name: bytes) -> str | None:
@@ -522,8 +573,100 @@ def _header_value(scope: Scope, name: bytes) -> str | None:
     return None
 
 
+_LOOPBACK_IDENTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+# Parse a Host header value: mandatory host, optional :port.  IPv6
+# addresses must be bracket-wrapped; raw IPv6 would be ambiguous
+# because addresses contain multiple colons.
+_HOST_RE = re.compile(
+    r"^\[(?P<v6>[^\]]+)\]:(?P<v6port>\d+)$"  # [::1]:port
+    r"|^\[(?P<v6noport>[^\]]+)\]$"  # [::1]
+    r"|^(?P<host>[^:]+):(?P<hostport>\d+)$"  # host:port
+    r"|^(?P<hostnoport>[^:]+)$"  # host
+)
+
+
+def _validate_loopback_host(host_value: str | None) -> bool:
+    """Return True when the Host header names a loopback address."""
+    if host_value is None:
+        return False
+    m = _HOST_RE.fullmatch(host_value)
+    if m is None:
+        return False
+    host = m.group("v6") or m.group("v6noport") or m.group("host") or m.group("hostnoport")
+    port_str = m.group("v6port") or m.group("hostport")
+    if port_str is not None:
+        port = int(port_str)
+        if not 1 <= port <= 65535:
+            return False
+    return host.lower() in _LOOPBACK_IDENTS
+
+
+# Match loopback HTTP/HTTPS origins with an optional numeric port.
+_ORIGIN_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost|\[::1\])(?::(\d+))?")
+
+
+def _validate_browser_origin(origin_value: str | None) -> bool:
+    """Return True when the Origin is absent (non-browser) or a loopback origin."""
+    if origin_value is None:
+        return True
+    # Opaque origins (null) are untrusted — reject them.
+    if origin_value == "null":
+        return False
+    m = _ORIGIN_RE.fullmatch(origin_value)
+    if m is None:
+        return False
+    port_str = m.group(1)
+    if port_str is not None:
+        port = int(port_str)
+        if not 1 <= port <= 65535:
+            return False
+    return True
+
+
+class _LimitedReceive:
+    """Wraps an ASGI *receive* callable, counting cumulative bytes.
+
+    Messages are passed through without buffering.  When the optional
+    byte cap is exceeded the wrapper sets the ``exceeded`` flag, drains
+    the remaining body chunks, and returns a final empty
+    ``http.request`` message so the downstream app sees a truncated
+    body that will fail its own parsing.
+    """
+
+    def __init__(self, receive: Receive, max_bytes: int | None) -> None:
+        self._receive = receive
+        self._max_bytes = max_bytes
+        self.received_bytes = 0
+        self.exceeded = False
+
+    async def __call__(self) -> Message:
+        message = await self._receive()
+        if message["type"] != "http.request":
+            return message
+
+        body_len = len(message.get("body", b""))
+        self.received_bytes += body_len
+
+        if self._max_bytes is not None and self.received_bytes > self._max_bytes:
+            self.exceeded = True
+            # Drain remaining body chunks (bounded to prevent runaway
+            # loops on a misbehaving transport).
+            _drained = 0
+            while message.get("more_body", False):
+                _drained += 1
+                if _drained > 65_536:
+                    break
+                message = await self._receive()
+            # Return an empty final frame — downstream will see a
+            # truncated body and fail to parse it.
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        return message
+
+
 class RequestMiddleware:
-    """Attach request IDs, log requests, and bound bodies before parsing."""
+    """Attach request IDs, validate Host/Origin, log requests, and bound bodies."""
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -549,9 +692,80 @@ class RequestMiddleware:
                 message = {**message, "headers": headers}
             await send(message)
 
+        async def _error_response(code: int, detail: str) -> None:
+            nonlocal status_code
+            status_code = code
+            response = JSONResponse(status_code=code, content={"detail": detail})
+            await response(scope, receive, send_with_request_id)
+
+        # ------------------------------------------------------------------
+        # Capped receive — counts bytes as downstream consumes the body
+        # without buffering the entire request in the middleware.
+        response_sent = False
         try:
+            # Validate Host header is loopback
+            host_value = _header_value(scope, b"host")
+            if not _validate_loopback_host(host_value):
+                await _error_response(421, "Misdirected Request")
+                return
+
+            # Validate Origin for browser-originated requests
+            origin_value = _header_value(scope, b"origin")
+            if not _validate_browser_origin(origin_value):
+                await _error_response(403, "Forbidden")
+                return
+
+            # Reject declared request bodies on methods that do not accept one.
+            # Drain before sending the response to preserve HTTP/1.1 transport
+            # integrity — the downstream consumer must not be left mid-body.
+            method = scope.get("method", "GET").upper()
+            _METHODS_WITHOUT_BODY = frozenset({"GET", "HEAD", "DELETE", "OPTIONS", "CONNECT", "TRACE"})
+            if method in _METHODS_WITHOUT_BODY:
+                cl_value = _header_value(scope, b"content-length")
+                te_value = _header_value(scope, b"transfer-encoding")
+                declared_body = False
+                if cl_value is not None:
+                    try:
+                        if int(cl_value) > 0:
+                            declared_body = True
+                    except ValueError:
+                        pass
+                if te_value is not None and "chunked" in te_value.lower():
+                    declared_body = True
+                if declared_body:
+                    drained = 0
+                    while True:
+                        message = await receive()
+                        if message["type"] == "http.disconnect":
+                            # Client disconnected while draining the
+                            # declared body — no client remains to
+                            # receive a response.
+                            return
+                        if message["type"] != "http.request":
+                            continue
+                        drained += len(message.get("body", b""))
+                        if drained > MAX_TRANSPORT_BODY_BYTES:
+                            # Drain remaining body frames (bounded) so
+                            # the transport stays in a clean state for
+                            # any subsequent request on this connection.
+                            _extra = 0
+                            while message.get("more_body", False):
+                                _extra += 1
+                                if _extra > 65_536:
+                                    break
+                                message = await receive()
+                                if message["type"] == "http.disconnect":
+                                    return
+                            break
+                        if not message.get("more_body", False):
+                            break
+                    await _error_response(413, "Request body is too large")
+                    return
+
             config = _get_runtime_config()
             max_body_bytes = _request_body_limit(config)
+
+            # Early reject when Content-Length is declared and too large.
             content_length = _header_value(scope, b"content-length")
             if content_length is not None:
                 try:
@@ -559,50 +773,55 @@ class RequestMiddleware:
                 except ValueError:
                     declared_length = 0
                 if max_body_bytes is not None and declared_length > max_body_bytes:
-                    status_code = 413
-                    response = JSONResponse(
-                        status_code=413,
-                        content={"detail": "Request body is too large"},
-                    )
-                    await response(scope, receive, send_with_request_id)
+                    await _error_response(413, "Request body is too large")
                     return
 
-            messages: list[Message] = []
-            received_bytes = 0
-            while True:
-                message = await receive()
-                messages.append(message)
-                if message["type"] != "http.request":
-                    break
-                received_bytes += len(message.get("body", b""))
-                if max_body_bytes is not None and received_bytes > max_body_bytes:
-                    status_code = 413
-                    response = JSONResponse(
-                        status_code=413,
-                        content={"detail": "Request body is too large"},
-                    )
-                    await response(scope, receive, send_with_request_id)
-                    return
-                if not message.get("more_body", False):
-                    break
+            capped_receive = _LimitedReceive(receive, max_body_bytes)
+            response_sent = False
 
-            async def replay_receive() -> Message:
-                if messages:
-                    return messages.pop(0)
-                return {"type": "http.request", "body": b"", "more_body": False}
+            async def send_checked(message: Message) -> None:
+                nonlocal status_code, response_sent
+                if message["type"] == "http.response.start":
+                    response_sent = True
+                    if capped_receive.exceeded:
+                        # Downstream got a truncated body; replace its error
+                        # response with a clean 413.
+                        status_code = 413
+                        await send_with_request_id(
+                            {
+                                "type": "http.response.start",
+                                "status": 413,
+                                "headers": [(b"content-type", b"application/json")],
+                            }
+                        )
+                        await send_with_request_id(
+                            {
+                                "type": "http.response.body",
+                                "body": b'{"detail":"Request body is too large"}',
+                                "more_body": False,
+                            }
+                        )
+                        return
+                    status_code = message["status"]
+                    await send_with_request_id(message)
+                elif not capped_receive.exceeded:
+                    await send_with_request_id(message)
+                # When exceeded, drop all non-start messages (the 413 body
+                # was already sent above).
 
-            await self.app(scope, replay_receive, send_with_request_id)
+            await self.app(scope, capped_receive, send_checked)
         except Exception:
             LOGGER.exception(
                 "unhandled error in request handler",
                 extra={"event": "request_error"},
             )
-            status_code = 500
-            response = JSONResponse(
-                status_code=500,
-                content={"detail": "Internal Server Error"},
-            )
-            await response(scope, receive, send_with_request_id)
+            if not response_sent:
+                status_code = 500
+                response = JSONResponse(
+                    status_code=500,
+                    content={"detail": "Internal Server Error"},
+                )
+                await response(scope, receive, send_with_request_id)
         finally:
             duration_ms = round((time.monotonic() - started) * 1000, 3)
             LOGGER.info(
@@ -658,6 +877,16 @@ def readiness() -> HealthResponse:
 @app.post("/save", response_model=SaveResponse, response_model_exclude_none=True)
 def save_text(request: SaveRequest) -> SaveResponse:
     config = _get_runtime_config()
+    try:
+        _probe_save_root(config.save_root)
+    except RuntimeError as exc:
+        LOGGER.warning(
+            "save_root identity check failed during save: %s",
+            exc,
+            exc_info=True,
+            extra={"event": "save_root_identity_failed"},
+        )
+        raise HTTPException(status_code=503, detail="Service is not ready") from exc
 
     try:
         text_bytes = len(request.text.encode("utf-8"))
@@ -708,6 +937,9 @@ def list_paths(prefix: str = "") -> PathsResponse:
     else:
         search_dir = save_root
 
+    if not _is_within(search_dir, save_root):
+        return PathsResponse(paths=[])
+
     if not search_dir.is_dir():
         return PathsResponse(paths=[])
 
@@ -745,6 +977,14 @@ def list_paths(prefix: str = "") -> PathsResponse:
                         extra={"event": "path_inspection_failed"},
                     )
                     continue
+                # Suppress exact file match before capping so the cap never
+                # reduces the result count below MAX_PATH_RESULTS because of
+                # an entry that will later be removed.
+                if not is_directory:
+                    relative_entry = str(search_dir.relative_to(save_root) / entry.name)
+                    if relative_entry == prefix:
+                        continue
+
                 bisect.insort(paths, (entry.name, is_directory))
                 if len(paths) > MAX_PATH_RESULTS:
                     paths.pop()
@@ -762,8 +1002,6 @@ def list_paths(prefix: str = "") -> PathsResponse:
     results = []
     for name, is_directory in paths:
         relative_path = str(relative_directory / name)
-        if not is_directory and relative_path == prefix:
-            continue
         if is_directory:
             relative_path += "/"
         results.append(relative_path)

@@ -610,7 +610,7 @@ def test_save_rejects_root_body_with_unpaired_surrogate(client: TestClient, tmp_
     assert list(tmp_path.iterdir()) == []
 
 
-def test_paths_excludes_symlinks_that_escape_save_root(
+def test_paths_includes_symlinks_that_escape_save_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     save_root = tmp_path / "root"
@@ -626,9 +626,9 @@ def test_paths_excludes_symlinks_that_escape_save_root(
         escaped_response = client.get("/paths", params={"prefix": "escape/"})
 
     assert root_response.status_code == 200
-    assert root_response.json() == {"paths": []}
+    assert root_response.json() == {"paths": ["escape/"]}
     assert escaped_response.status_code == 200
-    assert escaped_response.json() == {"paths": []}
+    assert escaped_response.json() == {"paths": ["escape/secret.txt"]}
 
 
 def test_paths_preserves_safe_internal_symlink_prefix(

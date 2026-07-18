@@ -714,13 +714,7 @@ def list_paths(prefix: str = "") -> PathsResponse:
     else:
         search_dir = save_root
 
-    try:
-        resolved_search_dir = search_dir.resolve()
-    except (OSError, RuntimeError, ValueError):
-        return PathsResponse(paths=[])
-    if not _is_within(resolved_search_dir, save_root):
-        return PathsResponse(paths=[])
-    if not resolved_search_dir.is_dir():
+    if not search_dir.is_dir():
         return PathsResponse(paths=[])
 
     prefix_lower = ""
@@ -731,7 +725,7 @@ def list_paths(prefix: str = "") -> PathsResponse:
 
     paths: list[tuple[str, bool]] = []
     try:
-        with os.scandir(resolved_search_dir) as entries:
+        with os.scandir(search_dir) as entries:
             for entry in islice(entries, MAX_PATH_SCAN_ENTRIES):
                 if _is_internal_temp_name(entry.name):
                     continue
@@ -746,10 +740,10 @@ def list_paths(prefix: str = "") -> PathsResponse:
                 if prefix_lower and not entry.name.lower().startswith(prefix_lower):
                     continue
                 try:
-                    resolved_entry = Path(entry.path).resolve()
-                    if not _is_within(resolved_entry, save_root):
+                    entry_path = search_dir / entry.name
+                    if not _is_within(entry_path, save_root):
                         continue
-                    is_directory = resolved_entry.is_dir()
+                    is_directory = Path(entry.path).resolve().is_dir()
                 except (OSError, RuntimeError):
                     LOGGER.warning(
                         "cannot inspect path suggestion",

@@ -23,11 +23,11 @@ create or modify those files directly. The code intentionally preserves symlink
 usability — e.g., `~/Ramdisk` → `/ramdisk` — which is a deliberate design
 choice documented here.
 
-The remaining containment checks are lexical only: `_expand_user_path()` uses
-`os.path.normpath()` to prevent `../` traversal, and the `/paths` endpoint
-still skips entries whose resolved targets fall outside `save_root`. But
-symlinks within `save_root` that point to any location (including
-`APPLICATION_ROOT`) are accepted.
+All containment checks are now lexical only: `_expand_user_path()` uses
+`os.path.normpath()` to prevent `../` traversal, and `/paths` checks the
+symlink path itself (not its resolved target) against `save_root`. This means
+symlinks within `save_root` that point **anywhere** — including outside
+`save_root` or into `APPLICATION_ROOT` — are accepted and listed.
 
 **When it would matter:** If `save_root` contains untrusted content, or the
 service is deployed on a shared multi-user host, or strict "writes never leave
